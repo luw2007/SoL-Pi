@@ -122,6 +122,9 @@ export const BOUNDARY_COMPACTION_INSTRUCTIONS =
 export const POST_COMPACTION_PLAN_REMINDER =
 	"Online context compaction finished. The parent task is still active. " +
 	"Before continuing work, call update_plan with a fresh plan for the remaining work.";
+export const POST_SKIPPED_COMPACTION_REMINDER =
+	"Online context compaction was skipped by the host. The parent task is still active. " +
+	"Continue with the remaining work from the current plan.";
 
 export type OnlineContextCompactOptions = {
 	readonly cacheWriteReadRatio?: number | null;
@@ -402,25 +405,30 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 				return;
 			}
 
+			// omp's compact() ends the agent loop before deciding whether it can
+			// compact (e.g. "Nothing to compact (session too small)"), so the task
+			// must be resumed whenever the session went idle, compacted or not.
 			selected = undefined;
 			let compacted = false;
+			let failure: unknown;
 			try {
 				compacted = await runBoundaryCompaction({ decision }, context);
+			} catch (error) {
+				failure = error;
 			} finally {
 				activeDebt = undefined;
 			}
-			if (!compacted) return;
-			if (!(await waitForIdle(context, 10_000))) {
-				throw new Error("Online context compact: session did not become idle after compaction");
+			if (compacted || (await waitForIdle(context, 2_000))) {
+				pi.sendMessage(
+					{
+						customType: "sol-pi-online-context-compact",
+						content: compacted ? POST_COMPACTION_PLAN_REMINDER : POST_SKIPPED_COMPACTION_REMINDER,
+						display: false,
+					},
+					{ triggerTurn: true },
+				);
 			}
-			pi.sendMessage(
-				{
-					customType: "sol-pi-online-context-compact",
-					content: POST_COMPACTION_PLAN_REMINDER,
-					display: false,
-				},
-				{ triggerTurn: true },
-			);
+			if (failure) throw failure;
 		});
 
 		// Runs the native compaction for a selected boundary. Resolves true when a
@@ -441,30 +449,36 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 						finished = true;
 						resolve();
 					};
-					context.compact({
-						customInstructions: BOUNDARY_COMPACTION_INSTRUCTIONS,
-						onComplete: (compaction) => {
-							try {
-								compacted = true;
-								const removed = Math.max(
-									0,
-									pending.decision.archiveTokens - tokenEstimate(compaction.summary),
-								);
-								if (removed > 0) {
-									showSolPiSavings(
-										context,
-										"Online Context Compact",
-										formatSavingsCount(removed, "context tokens removed"),
+					// omp's compact() returns a promise that rejects instead of calling onError.
+					Promise.resolve(
+						context.compact({
+							customInstructions: BOUNDARY_COMPACTION_INSTRUCTIONS,
+							onComplete: (compaction) => {
+								try {
+									compacted = true;
+									const removed = Math.max(
+										0,
+										pending.decision.archiveTokens - tokenEstimate(compaction.summary),
 									);
+									if (removed > 0) {
+										showSolPiSavings(
+											context,
+											"Online Context Compact",
+											formatSavingsCount(removed, "context tokens removed"),
+										);
+									}
+								} finally {
+									finish();
 								}
-							} finally {
+							},
+							onError: (error) => {
+								compactionError = error;
 								finish();
-							}
-						},
-						onError: (error) => {
-							compactionError = error;
-							finish();
-						},
+							},
+						}) as unknown,
+					).catch((error: unknown) => {
+						compactionError = error instanceof Error ? error : new Error(String(error));
+						finish();
 					});
 				});
 			} finally {
@@ -473,7 +487,8 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			if (
 				compactionError &&
 				compactionError.name !== "AbortError" &&
-				compactionError.message !== "Compaction cancelled"
+				compactionError.message !== "Compaction cancelled" &&
+				!compactionError.message.startsWith("Nothing to compact")
 			) {
 				throw compactionError;
 			}
