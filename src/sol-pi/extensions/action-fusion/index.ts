@@ -66,6 +66,33 @@ function memoizeByCwd<T>(create: (cwd: string) => T): (cwd: string) => T {
 	};
 }
 
+/*
+ * omp compat: the oh-my-pi (omp) harness describes tool parameters with its own
+ * schema values instead of a TypeBox `Type.Object`, so `parameters.properties`
+ * is empty there — and those values are callable, not plain objects. They expose
+ * `toJsonSchema()`, which carries the same property set plus the required-key
+ * list, so rebuild the properties from it.
+ */
+function hostToolProperties(parameters: unknown): Record<string, unknown> {
+	if (!parameters || (typeof parameters !== "object" && typeof parameters !== "function")) return {};
+	if ("properties" in parameters) {
+		const properties = parameters.properties as Record<string, unknown>;
+		if (properties && Object.keys(properties).length > 0) return properties;
+	}
+	if (!("toJsonSchema" in parameters) || typeof parameters.toJsonSchema !== "function") return {};
+	const json = parameters.toJsonSchema() as {
+		properties?: Record<string, unknown>;
+		required?: readonly string[];
+	};
+	const required = new Set(json.required ?? []);
+	return Object.fromEntries(
+		Object.entries(json.properties ?? {}).map(([key, schema]) => [
+			key,
+			required.has(key) ? schema : Type.Optional(schema as never),
+		]),
+	);
+}
+
 export function createActionFusionExtension(options: ActionFusionOptions = {}): ExtensionFactory {
 	const baseEdit = memoizeByCwd((cwd: string) => createEditToolDefinition(cwd, options.editOptions));
 	const baseWrite = memoizeByCwd((cwd: string) => createWriteToolDefinition(cwd, options.writeOptions));
@@ -74,48 +101,60 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 		const editTemplate = baseEdit(process.cwd());
 		const writeTemplate = baseWrite(process.cwd());
 
+		const editProperties = hostToolProperties(editTemplate.parameters);
+		const writeProperties = hostToolProperties(writeTemplate.parameters);
+
 		const editParameters = Type.Object({
-			...editTemplate.parameters.properties,
+			...editProperties,
 			then_run: createThenRunSchema(EDIT_THEN_RUN_DESCRIPTION),
 		});
 		const writeParameters = Type.Object({
-			...writeTemplate.parameters.properties,
+			...writeProperties,
 			then_run: createThenRunSchema(WRITE_THEN_RUN_DESCRIPTION),
 		});
 
-		pi.registerTool<typeof editParameters, EditToolDetails | undefined>({
-			...editTemplate,
-			parameters: editParameters,
-			async execute(toolCallId, input, signal, onUpdate, ctx) {
-				const { then_run, ...editInput } = input as typeof input & { then_run?: ThenRunInput };
-				const result = await executeMutationThenRun({
-					toolCallId,
-					absolutePath: resolveToolPath(ctx.cwd, input.path),
-					thenRun: then_run,
-					bashOptions: options.bashOptions,
-					signal,
-					ctx,
-					mutate: () => baseEdit(ctx.cwd).execute(toolCallId, editInput, signal, onUpdate, ctx),
-				});
-				if (
-					then_run &&
-					result.content.some((block) => block.type === "text" && block.text.includes(THEN_RUN_SUCCEEDED))
-				) {
-					showSolPiSavings(ctx, "Action Fusion", "1 model round-trip avoided");
-				}
-				return result;
-			},
-			renderCall: (args, theme, context) => {
-				const base = baseEdit(context.cwd).renderCall!(args, theme, context);
-				return args.then_run ? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base) : base;
-			},
-			renderResult: (result, resultOptions, theme, context) => {
-				const base = baseEdit(context.cwd).renderResult!(result, resultOptions, theme, context);
-				return context.args.then_run
-					? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
-					: base;
-			},
-		});
+		// The fused queue and the pre-command hash check are keyed on one target
+		// file, so only replace a mutation tool that names its target with `path`.
+		// omp's `edit` takes a multi-section hashline patch instead; leave it alone.
+		if ("path" in editProperties) {
+			pi.registerTool<typeof editParameters, EditToolDetails | undefined>({
+				...editTemplate,
+				parameters: editParameters,
+				async execute(toolCallId, input, signal, onUpdate, ctx) {
+					const { then_run, ...editInput } = input as typeof input & { then_run?: ThenRunInput };
+					const result = await executeMutationThenRun({
+						toolCallId,
+						absolutePath: resolveToolPath(ctx.cwd, input.path),
+						thenRun: then_run,
+						bashOptions: options.bashOptions,
+						signal,
+						ctx,
+						mutate: () => baseEdit(ctx.cwd).execute(toolCallId, editInput, signal, onUpdate, ctx),
+					});
+					if (
+						then_run &&
+						result.content.some((block) => block.type === "text" && block.text.includes(THEN_RUN_SUCCEEDED))
+					) {
+						showSolPiSavings(ctx, "Action Fusion", "1 model round-trip avoided");
+					}
+					return result;
+				},
+				renderCall: (args, theme, context) => {
+					const base = baseEdit(context.cwd).renderCall!(args, theme, context);
+					return args.then_run
+						? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
+						: base;
+				},
+				renderResult: (result, resultOptions, theme, context) => {
+					const base = baseEdit(context.cwd).renderResult!(result, resultOptions, theme, context);
+					return context.args.then_run
+						? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
+						: base;
+				},
+			});
+		}
+
+		if (!("path" in writeProperties)) return;
 
 		pi.registerTool<typeof writeParameters, undefined>({
 			...writeTemplate,
