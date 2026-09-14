@@ -42,8 +42,9 @@ export type { PlanProgress, PlanUpdateInput } from "./tools.ts";
 export function registerOnlineContextCompact(
 	pi: ExtensionAPI,
 	cacheWriteReadRatio = DEFAULT_CACHE_WRITE_READ_RATIO,
+	keepRecentTokens?: number,
 ): void {
-	createOnlineContextCompactExtension({ cacheWriteReadRatio })(pi);
+	createOnlineContextCompactExtension({ cacheWriteReadRatio, keepRecentTokens })(pi);
 }
 
 export default registerOnlineContextCompact;
