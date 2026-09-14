@@ -134,6 +134,12 @@ function tokenEstimate(text: string): number {
 	return Math.ceil(Buffer.byteLength(text) / 4);
 }
 
+// omp compat: getSystemPrompt() returns string[] (one entry per prompt section) in omp.
+function systemPromptTokens(context: ExtensionContext): number {
+	const prompt: unknown = context.getSystemPrompt();
+	return tokenEstimate(Array.isArray(prompt) ? prompt.join("\n") : String(prompt ?? ""));
+}
+
 function result(text: string, details: Readonly<Record<string, unknown>>): AgentToolResult<Readonly<Record<string, unknown>>> {
 	return { content: [{ type: "text", text }], details };
 }
@@ -258,7 +264,7 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		const save = (): void => appendOnlineState(pi, state);
 		const contextTokens = (context: ExtensionContext): number => {
 			const visible = observedMessages.reduce((total, message) => total + estimateTokens(message), 0);
-			const estimated = visible + tokenEstimate(context.getSystemPrompt());
+			const estimated = visible + systemPromptTokens(context);
 			const reported = context.getContextUsage()?.tokens;
 			return validPositiveInteger(reported) ? Math.max(reported, estimated) : estimated;
 		};
@@ -339,7 +345,7 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 
 			const usage = context.getContextUsage();
 			const writeTokens = contextTokens(context);
-			const fixedTokens = tokenEstimate(context.getSystemPrompt());
+			const fixedTokens = systemPromptTokens(context);
 			const archiveTokens = Math.max(0, writeTokens - fixedTokens - keepRecentTokens);
 			const contextWindowTokens = validPositiveInteger(usage?.contextWindow)
 				? usage.contextWindow
