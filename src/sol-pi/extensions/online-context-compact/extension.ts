@@ -56,6 +56,25 @@ const hostModule = piCodingAgent as unknown as {
 	sessionEntryToContextMessages?: (entry: SessionEntry) => readonly unknown[];
 };
 
+/*
+ * omp compat: omp has no `agent_settled` event, and `context.compact()` itself
+ * ends the running agent loop (the session is idle by the time `onComplete`
+ * fires). It also skips `session_stop` for aborted loops. So on omp the
+ * boundary compaction runs inline from `turn_end` and the continuation turn is
+ * started directly once the session reports idle, instead of the
+ * abort → agent_settled → compact → continue sequence pi uses.
+ */
+const ompHost = piCodingAgent.CONFIG_DIR_NAME === ".omp";
+
+async function waitForIdle(context: ExtensionContext, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (!context.isIdle()) {
+		if (Date.now() >= deadline) return false;
+		await new Promise<void>((resolve) => setTimeout(resolve, 50));
+	}
+	return true;
+}
+
 function entryMessage(entry: SessionEntry): AgentMessage | undefined {
 	if (!entry || typeof entry !== "object" || !("message" in entry)) return undefined;
 	// Unchecked cast: session entries that carry a message carry an agent message.
@@ -327,7 +346,7 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			return { action: "continue" as const };
 		});
 
-		pi.on("turn_end", (event, context) => {
+		pi.on("turn_end", async (event, context) => {
 			const boundary = pendingBoundary;
 			pendingBoundary = undefined;
 			if (!boundary || selected) return;
@@ -378,26 +397,35 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			if (!decision.compact) return;
 
 			selected = { decision };
-			context.abort();
+			if (!ompHost) {
+				context.abort();
+				return;
+			}
+
+			selected = undefined;
+			let compacted = false;
+			try {
+				compacted = await runBoundaryCompaction({ decision }, context);
+			} finally {
+				activeDebt = undefined;
+			}
+			if (!compacted) return;
+			if (!(await waitForIdle(context, 10_000))) {
+				throw new Error("Online context compact: session did not become idle after compaction");
+			}
+			pi.sendMessage(
+				{
+					customType: "sol-pi-online-context-compact",
+					content: POST_COMPACTION_PLAN_REMINDER,
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
 		});
 
-		pi.on("agent_settled", async (_event, context) => {
-			// sendMessage() starts a turn without returning its promise. Capture the
-			// child settlement so print/JSON mode cannot dispose while it is running.
-			const parentContinuation = nextContinuation;
-			nextContinuation = undefined;
-			const pending = selected;
-			selected = undefined;
-			if (!context.isIdle()) {
-				selected = pending;
-				nextContinuation = parentContinuation;
-				return;
-			}
-			if (!pending) {
-				releaseParentContinuation(parentContinuation);
-				return;
-			}
-
+		// Runs the native compaction for a selected boundary. Resolves true when a
+		// compaction was applied, false when the host cancelled it.
+		const runBoundaryCompaction = async (pending: SelectedCompaction, context: ExtensionContext): Promise<boolean> => {
 			activeDebt = {
 				debtTokens: pending.decision.writeTokens * (pending.decision.incrementalCacheCostRatio ?? 0),
 				repaymentTokens: Math.max(0, pending.decision.archiveTokens - pending.decision.memoTokens),
@@ -439,14 +467,39 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 						},
 					});
 				});
+			} finally {
 				compactionInFlight = false;
-				if (
-					compactionError &&
-					compactionError.name !== "AbortError" &&
-					compactionError.message !== "Compaction cancelled"
-				) {
-					throw compactionError;
-				}
+			}
+			if (
+				compactionError &&
+				compactionError.name !== "AbortError" &&
+				compactionError.message !== "Compaction cancelled"
+			) {
+				throw compactionError;
+			}
+			return compacted;
+		};
+
+		pi.on("agent_settled", async (_event, context) => {
+			// sendMessage() starts a turn without returning its promise. Capture the
+			// child settlement so print/JSON mode cannot dispose while it is running.
+			const parentContinuation = nextContinuation;
+			nextContinuation = undefined;
+			const pending = selected;
+			selected = undefined;
+			if (!context.isIdle()) {
+				selected = pending;
+				nextContinuation = parentContinuation;
+				return;
+			}
+			if (!pending) {
+				releaseParentContinuation(parentContinuation);
+				return;
+			}
+
+			let compacted = false;
+			try {
+				compacted = await runBoundaryCompaction(pending, context);
 
 				if (compacted) {
 					let resolveContinuation!: () => void;
@@ -479,7 +532,6 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 					await continuation.promise;
 				}
 			} finally {
-				compactionInFlight = false;
 				activeDebt = undefined;
 				releaseParentContinuation(parentContinuation);
 			}
