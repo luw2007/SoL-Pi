@@ -56,8 +56,10 @@ const hostModule = piCodingAgent as unknown as {
 	sessionEntryToContextMessages?: (entry: SessionEntry) => readonly unknown[];
 };
 
-function entryMessage(entry: SessionEntry): unknown {
-	return entry && typeof entry === "object" && "message" in entry ? entry.message : undefined;
+function entryMessage(entry: SessionEntry): AgentMessage | undefined {
+	if (!entry || typeof entry !== "object" || !("message" in entry)) return undefined;
+	// Unchecked cast: session entries that carry a message carry an agent message.
+	return entry.message as AgentMessage;
 }
 
 function entryContextMessageCount(entry: SessionEntry): number {
@@ -86,7 +88,8 @@ function findCutPoint(
 			firstKeptEntryIndex = index;
 			continue;
 		}
-		kept += estimateTokens(JSON.stringify(entryMessage(entry) ?? ""));
+		const message = entryMessage(entry);
+		if (message) kept += estimateTokens(message);
 		if (kept > keepRecentTokens) break;
 		firstKeptEntryIndex = index;
 	}

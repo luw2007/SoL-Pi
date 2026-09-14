@@ -66,14 +66,19 @@ function memoizeByCwd<T>(create: (cwd: string) => T): (cwd: string) => T {
 	};
 }
 
-/*
- * omp compat: the oh-my-pi (omp) harness describes tool parameters with its own
- * schema values instead of a TypeBox `Type.Object`, so `parameters.properties`
- * is empty there — and those values are callable, not plain objects. They expose
- * `toJsonSchema()`, which carries the same property set plus the required-key
- * list, so rebuild the properties from it.
+/**
+ * The built-in tool's own parameter properties, which the fused tool re-declares
+ * alongside `then_run`.
+ *
+ * Pi publishes them as a TypeBox `Type.Object`, so `parameters.properties` is
+ * the whole contract. A Pi-compatible host may describe the same tool with its
+ * own schema value instead — potentially callable rather than a plain object,
+ * and exposing the contract only through `toJsonSchema()`. Reading `.properties`
+ * alone yields `{}` there, which would publish a fused tool carrying `then_run`
+ * and nothing else: the model can no longer send `path`, and the fused execute
+ * path resolves an undefined target. Rebuild from `toJsonSchema()` in that case.
  */
-function hostToolProperties(parameters: unknown): Record<string, unknown> {
+export function hostToolProperties(parameters: unknown): Record<string, unknown> {
 	if (!parameters || (typeof parameters !== "object" && typeof parameters !== "function")) return {};
 	if ("properties" in parameters) {
 		const properties = parameters.properties as Record<string, unknown>;
@@ -101,8 +106,15 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 		const editTemplate = baseEdit(process.cwd());
 		const writeTemplate = baseWrite(process.cwd());
 
-		const editProperties = hostToolProperties(editTemplate.parameters);
-		const writeProperties = hostToolProperties(writeTemplate.parameters);
+		// Unchecked cast: on a TypeBox host these are exactly the built-in tool's
+		// own properties; on a reduced host they are rebuilt from the same schema,
+		// so the fused tool keeps the built-in argument contract either way.
+		const editProperties = hostToolProperties(
+			editTemplate.parameters,
+		) as typeof editTemplate.parameters.properties;
+		const writeProperties = hostToolProperties(
+			writeTemplate.parameters,
+		) as typeof writeTemplate.parameters.properties;
 
 		const editParameters = Type.Object({
 			...editProperties,
@@ -115,7 +127,9 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 
 		// The fused queue and the pre-command hash check are keyed on one target
 		// file, so only replace a mutation tool that names its target with `path`.
-		// omp's `edit` takes a multi-section hashline patch instead; leave it alone.
+		// A host whose edit tool takes a different shape (a multi-file patch, say)
+		// keeps its built-in tool rather than getting a fused one that cannot
+		// resolve a target.
 		if ("path" in editProperties) {
 			pi.registerTool<typeof editParameters, EditToolDetails | undefined>({
 				...editTemplate,
