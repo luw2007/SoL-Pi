@@ -22,6 +22,8 @@ export interface SolPiConfig {
 	readonly evidencePreservingReducerProvider: string;
 	readonly onlineContextCompact: boolean;
 	readonly cacheWriteReadRatio: number;
+	/** Host keep-recent budget for boundary compaction feasibility; undefined = extension default. */
+	readonly keepRecentTokens?: number;
 }
 
 export const DEFAULT_CONFIG: SolPiConfig = Object.freeze({
@@ -42,7 +44,13 @@ const FEATURE_KEYS = [
 	"onlineContextCompact",
 ] as const;
 const STRING_KEYS = ["evidencePreservingReducerModel", "evidencePreservingReducerProvider"] as const;
-const CONFIG_KEYS = new Set<string>(["version", ...FEATURE_KEYS, ...STRING_KEYS, "cacheWriteReadRatio"]);
+const CONFIG_KEYS = new Set<string>([
+	"version",
+	...FEATURE_KEYS,
+	...STRING_KEYS,
+	"cacheWriteReadRatio",
+	"keepRecentTokens",
+]);
 
 export function findConfigPath(
 	cwd = process.cwd(),
@@ -98,6 +106,13 @@ export function loadSolPiConfig(
 		cacheWriteReadRatio < 0
 	) {
 		throw new Error(`SoL-Pi config cacheWriteReadRatio must be a finite non-negative number: ${path}`);
+	}
+	const keepRecentTokens = record.keepRecentTokens;
+	if (
+		keepRecentTokens !== undefined &&
+		(typeof keepRecentTokens !== "number" || !Number.isSafeInteger(keepRecentTokens) || keepRecentTokens <= 0)
+	) {
+		throw new Error(`SoL-Pi config keepRecentTokens must be a positive integer: ${path}`);
 	}
 	const evidencePreservingReducerModel = stringConfigValue(
 		record,
