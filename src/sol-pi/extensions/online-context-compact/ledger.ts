@@ -13,9 +13,20 @@ import { dirname } from "node:path";
  * evidence that compaction was correctly deferred — it may mean this
  * mechanism's `pendingBoundary` gate was never satisfied (e.g. the session
  * only used a different plan-tracking tool). Fail-open: a write failure is
- * logged and swallowed, never thrown, and never blocks the caller's own
- * return. This is fail-open, not latency-free — the caller still awaits the
- * write attempt before proceeding.
+ * logged and swallowed, never thrown.
+ *
+ * Not latency-free, and deliberately NOT synchronous with its caller's own
+ * state handoff: the returned function's body runs synchronously only up to
+ * its own first `await` (`await mkdir`), so calling it starts the write and
+ * returns a pending promise immediately without blocking anything the caller
+ * does next. `online-context-compact/extension.ts`'s `turn_end` handler
+ * relies on exactly this — it fires the write, then performs its
+ * `selected`/`context.abort()` handoff in the same synchronous tick with no
+ * `await` in between (a real race existed here: awaiting the write BEFORE
+ * that handoff let `agent_settled` consume `selected` before it was ever
+ * set), and only awaits the write's promise right before each of its own
+ * return paths — so every invocation still produces exactly one ledger row,
+ * just no longer on the handoff's critical path.
  */
 export type CompactionLedger = (entry: Record<string, unknown>) => Promise<void>;
 

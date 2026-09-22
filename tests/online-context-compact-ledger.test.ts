@@ -262,6 +262,84 @@ describe("online context compact turn_end ledger", () => {
 		expect(rowsAfterSecond[1]).toMatchObject({ bucket: "already_selected", decisionEvaluated: false });
 	});
 
+	it("performs the selected/abort handoff synchronously, before the ledger write's own I/O has a chance to let anything interleave", async () => {
+		// Regression test for the actual bug: the ledger write used to be the
+		// handler's FIRST await, sitting BEFORE `selected = { decision }` /
+		// `context.abort()`. That let the promise machinery yield control
+		// mid-handler while the decision to compact was already made but not
+		// yet acted on — on pi (non-omp), `context.abort()` synchronously
+		// triggers `agent_settled` -> compact's consumption of `selected` in
+		// the SAME tick it is called, so anything that could observe or act on
+		// state between "decided" and "handed off" was a live race. Proving
+		// this requires observing state WHILE the handler's own promise is
+		// still pending, not after `await`ing it to completion (every other
+		// test in this suite awaits fully and so cannot detect this class of
+		// bug — see the `extension.ts` call-site comment for why the fix
+		// fires the ledger write without awaiting it first).
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		for (let i = 0; i < 3; i++) {
+			manager.appendMessage({ role: "user", content: `turn ${i}: ${"x".repeat(200)}`, timestamp: Date.now() });
+		}
+		const pi = new FakePi();
+		createOnlineContextCompactExtension({ keepRecentTokens: 10 })(pi.asExtensionApi());
+		let aborted = false;
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 5_000, contextWindow: 20_000, percent: 0.25 }),
+			abort: () => {
+				aborted = true;
+			},
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([assistant("x".repeat(20_000))], context);
+
+		const plan = pi.tool("update_plan");
+		await plan.execute!(
+			"plan-open",
+			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
+			undefined,
+			() => {},
+			context,
+		);
+		await plan.execute!(
+			"plan-done",
+			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
+			undefined,
+			() => {},
+			context,
+		);
+
+		// Deliberately NOT awaited yet: a JS function call runs synchronously
+		// up to its own first `await`/return, and that holds transitively
+		// through every layer here (`FakePi.emit`'s own async body, calling
+		// the turn_end handler, calling `compactionLedgerFor(context)(entry)`
+		// which itself only suspends at `await mkdir` INSIDE the ledger, never
+		// back out to this call site). So if the handoff is truly synchronous
+		// and ahead of the ledger write, `aborted` must already be `true` the
+		// instant this call returns — before any `await` in this test file
+		// runs at all.
+		const pending = pi.emit(
+			"turn_end",
+			{
+				type: "turn_end",
+				turnIndex: 1,
+				message: assistantMessage(),
+				toolResults: [
+					{ role: "toolResult", toolCallId: "plan-done", toolName: "update_plan", content: [], isError: false, timestamp: Date.now() },
+				],
+			},
+			context,
+		);
+		expect(aborted).toBe(true);
+
+		await pending;
+		const rows = await readLedgerRows(sessionDir);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ decisionEvaluated: true, willCompact: true, reason: "window_protection" });
+	});
+
 	it("records boundary_tool_result_error and never evaluates decideCompaction when the plan tool call itself errored", async () => {
 		const sessionDir = await sessionRoot();
 		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
