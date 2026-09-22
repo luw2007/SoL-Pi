@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  */
+import { join } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import {
@@ -11,6 +12,7 @@ import {
 	type ExtensionFactory,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { runtimeRoot } from "../../runtime-paths.ts";
 import { formatSavingsCount, showSolPiSavings } from "../../tui.ts";
 import {
 	DEFAULT_COMPACTION_ECONOMICS,
@@ -18,6 +20,7 @@ import {
 	type CompactionDecision,
 } from "./economics.ts";
 import { analyzePlanTransition, formatPlanSnapshot, parsePlanSteps } from "./plan.ts";
+import { createCompactionLedger, type CompactionLedger } from "./ledger.ts";
 import {
 	appendOnlineState,
 	initialOnlineState,
@@ -30,6 +33,7 @@ import {
 	type ProgressSummary,
 } from "./state.ts";
 import { registerOnlineTools, type PlanUpdateInput } from "./tools.ts";
+import { classifyTurnEnd } from "./turn-end-classifier.ts";
 
 /*
  * omp compat: the oh-my-pi (omp) harness re-exports a reduced
@@ -257,6 +261,17 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		let activeDebt: CacheDebt | undefined;
 		let nextContinuation: PendingContinuation | undefined;
 		let compactionInFlight = false;
+		let turnEndSeq = 0;
+		const compactionLedgers = new Map<string, CompactionLedger>();
+		const compactionLedgerFor = (context: ExtensionContext): CompactionLedger => {
+			const root = runtimeRoot(context);
+			let ledger = compactionLedgers.get(root);
+			if (!ledger) {
+				ledger = createCompactionLedger(join(root, "online-context-compact", "turn-end-ledger.jsonl"));
+				compactionLedgers.set(root, ledger);
+			}
+			return ledger;
+		};
 
 		const releaseContinuation = (): void => {
 			const continuation = nextContinuation;
@@ -352,58 +367,106 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		pi.on("turn_end", async (event, context) => {
 			const boundary = pendingBoundary;
 			pendingBoundary = undefined;
-			if (!boundary || selected) return;
-			const toolResult = event.toolResults.find((item) => item.toolCallId === boundary.toolCallId);
-			if (
-				event.message.role !== "assistant" ||
-				event.message.stopReason === "error" ||
-				event.message.stopReason === "aborted" ||
-				context.signal?.aborted ||
-				!toolResult ||
-				toolResult.isError
-			) {
-				return;
+			const toolResult = boundary
+				? event.toolResults.find((item) => item.toolCallId === boundary.toolCallId)
+				: undefined;
+			const classification = classifyTurnEnd({
+				hasPendingBoundary: Boolean(boundary),
+				hasAlreadySelected: Boolean(selected),
+				messageRole: event.message.role,
+				stopReason: event.message.role === "assistant" ? event.message.stopReason : undefined,
+				contextAborted: Boolean(context.signal?.aborted),
+				toolResultFound: Boolean(toolResult),
+				toolResultIsError: Boolean(toolResult?.isError),
+			});
+
+			let decision: CompactionDecision | undefined;
+			if (classification.decisionEvaluated) {
+				const usage = context.getContextUsage();
+				const writeTokens = contextTokens(context);
+				const fixedTokens = systemPromptTokens(context);
+				const archiveTokens = Math.max(0, writeTokens - fixedTokens - keepRecentTokens);
+				const contextWindowTokens = validPositiveInteger(usage?.contextWindow)
+					? usage.contextWindow
+					: validPositiveInteger(context.model?.contextWindow)
+						? context.model.contextWindow
+						: null;
+				const averageContextTokenIncrement =
+					state.positiveContextDeltaCount === 0
+						? null
+						: state.positiveContextDeltaTotal / state.positiveContextDeltaCount;
+				const priced = decideCompaction({
+					writeTokens,
+					archiveTokens,
+					memoTokens: DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE,
+					contextTokens: writeTokens,
+					completedBoundaryRequestCounts: state.completedBoundaryRequestCounts,
+					remainingBoundaries: state.plan.filter((step) => step.status !== "completed").length,
+					averageContextTokenIncrement,
+					contextWindowTokens,
+					priorCompactionCount: state.nativeCompactionCount,
+					carriedDebtTokens: state.cacheDebtTokens,
+					cacheDebtRepaymentTokens: state.cacheDebtRepaymentTokens,
+					cacheWriteReadRatio,
+					economics: DEFAULT_COMPACTION_ECONOMICS,
+				});
+				decision =
+					priced.compact && !nativeCompactionFeasible(context.sessionManager.getBranch(), keepRecentTokens)
+						? { ...priced, compact: false, reason: "native_not_compactable" }
+						: priced;
 			}
 
-			const usage = context.getContextUsage();
-			const writeTokens = contextTokens(context);
-			const fixedTokens = systemPromptTokens(context);
-			const archiveTokens = Math.max(0, writeTokens - fixedTokens - keepRecentTokens);
-			const contextWindowTokens = validPositiveInteger(usage?.contextWindow)
-				? usage.contextWindow
-				: validPositiveInteger(context.model?.contextWindow)
-					? context.model.contextWindow
-					: null;
-			const averageContextTokenIncrement =
-				state.positiveContextDeltaCount === 0
-					? null
-					: state.positiveContextDeltaTotal / state.positiveContextDeltaCount;
-			const priced = decideCompaction({
-				writeTokens,
-				archiveTokens,
-				memoTokens: DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE,
-				contextTokens: writeTokens,
-				completedBoundaryRequestCounts: state.completedBoundaryRequestCounts,
-				remainingBoundaries: state.plan.filter((step) => step.status !== "completed").length,
-				averageContextTokenIncrement,
-				contextWindowTokens,
-				priorCompactionCount: state.nativeCompactionCount,
-				carriedDebtTokens: state.cacheDebtTokens,
-				cacheDebtRepaymentTokens: state.cacheDebtRepaymentTokens,
-				cacheWriteReadRatio,
-				economics: DEFAULT_COMPACTION_ECONOMICS,
-			});
-			const decision: CompactionDecision =
-				priced.compact && !nativeCompactionFeasible(context.sessionManager.getBranch(), keepRecentTokens)
-					? { ...priced, compact: false, reason: "native_not_compactable" }
-					: priced;
-			if (!decision.compact) return;
+			// The ledger write is fired here but NOT awaited yet: `selected` /
+			// `context.abort()` below must happen synchronously, in the same
+			// tick as this handler resumes, with no `await` in between. On pi
+			// (non-omp), `context.abort()` triggers `agent_settled` -> compact
+			// consumption of `selected` (comment below, and the handler at
+			// `pi.on("agent_settled", ...)`), and the host does not wait for
+			// this turn_end handler's own promise to settle first. Awaiting the
+			// ledger write before the handoff would let that consumption race
+			// ahead of `selected` ever being set, silently dropping every
+			// compaction. Every return path below still awaits `ledgerWrite`
+			// before resolving, so the ledger keeps exactly one fail-open entry
+			// per invocation — it is just no longer on the handoff's critical
+			// path.
+			turnEndSeq += 1;
+			let ledgerWrite: Promise<void> = Promise.resolve();
+			try {
+				ledgerWrite = compactionLedgerFor(context)({
+					event: "turn_end_classification",
+					turnEndSeq,
+					bucket: classification.bucket,
+					decisionEvaluated: classification.decisionEvaluated,
+					reason: decision?.reason ?? classification.bucket,
+					willCompact: decision?.compact ?? false,
+					requestCountAtEmit: state.requestCount,
+					raw: classification.raw,
+				}).catch((error) => {
+					// Fail-open: an async ledger write failure must never cost the
+					// turn its actual compaction decision.
+					const reason = error instanceof Error ? error.message : String(error);
+					console.error(`[online-context-compact] fail-open turn_end ledger: ${reason}`);
+				});
+			} catch (error) {
+				// Fail-open: a synchronous ledger failure (e.g. runtimeRoot()
+				// requiring a persistent session directory) must never cost the
+				// turn its actual compaction decision either.
+				const reason = error instanceof Error ? error.message : String(error);
+				console.error(`[online-context-compact] fail-open turn_end ledger: ${reason}`);
+			}
+
+			if (!decision || !decision.compact) {
+				await ledgerWrite;
+				return;
+			}
 
 			selected = { decision };
 			if (!ompHost) {
 				context.abort();
+				await ledgerWrite;
 				return;
 			}
+			await ledgerWrite;
 
 			// omp's compact() ends the agent loop before deciding whether it can
 			// compact (e.g. "Nothing to compact (session too small)"), so the task

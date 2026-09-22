@@ -1,0 +1,334 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ */
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { afterEach, describe, expect, it } from "vitest";
+import { createOnlineContextCompactExtension } from "../src/sol-pi/extensions/online-context-compact/extension.ts";
+import { FakePi, FakeSessionManager, fakeContext } from "./helpers.ts";
+
+const roots: string[] = [];
+const SESSION_ID = "ledger-probe-session";
+
+afterEach(async () => {
+	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+function assistant(text: string): AgentMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "test",
+		provider: "test",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+async function sessionRoot(): Promise<string> {
+	const value = await mkdtemp(join(tmpdir(), "online-compact-ledger-test-"));
+	roots.push(value);
+	return value;
+}
+
+async function readLedgerRows(sessionDir: string): Promise<Array<Record<string, unknown>>> {
+	const content = await readFile(
+		join(sessionDir, "sol-pi", SESSION_ID, "online-context-compact", "turn-end-ledger.jsonl"),
+		"utf8",
+	);
+	return content
+		.trim()
+		.split("\n")
+		.filter((line) => line.length > 0)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function assistantMessage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		role: "assistant" as const,
+		content: [],
+		attribution: "agent",
+		timestamp: Date.now(),
+		stopReason: "stop",
+		...overrides,
+	};
+}
+
+describe("online context compact turn_end ledger", () => {
+	it("records no_boundary when update_plan was never called, without ever evaluating decideCompaction", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		const pi = new FakePi();
+		createOnlineContextCompactExtension()(pi.asExtensionApi());
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 1_000, contextWindow: 200_000, percent: 0.5 }),
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([], context);
+		await pi.emit(
+			"turn_end",
+			{ type: "turn_end", turnIndex: 1, message: assistantMessage(), toolResults: [] },
+			context,
+		);
+
+		const rows = await readLedgerRows(sessionDir);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ bucket: "no_boundary", decisionEvaluated: false, willCompact: false });
+	});
+
+	it("records no_boundary on a repeat turn_end even while a prior decision is still pending settlement, because pendingBoundary was already consumed", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		const pi = new FakePi();
+		createOnlineContextCompactExtension()(pi.asExtensionApi());
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 1_000, contextWindow: 200_000, percent: 0.5 }),
+			// Never settles, so `selected` stays populated across the next turn_end.
+			compact: () => new Promise<never>(() => {}),
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([], context);
+
+		const plan = pi.tool("update_plan");
+		await plan.execute!(
+			"plan-open",
+			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
+			undefined,
+			() => {},
+			context,
+		);
+		await plan.execute!(
+			"plan-done",
+			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
+			undefined,
+			() => {},
+			context,
+		);
+
+		// First turn_end: boundary pending, nothing selected yet -> evaluates.
+		await pi.emit(
+			"turn_end",
+			{
+				type: "turn_end",
+				turnIndex: 1,
+				message: assistantMessage(),
+				toolResults: [
+					{ role: "toolResult", toolCallId: "plan-done", toolName: "update_plan", content: [], isError: false, timestamp: Date.now() },
+				],
+			},
+			context,
+		);
+
+		const rowsAfterFirst = await readLedgerRows(sessionDir);
+		expect(rowsAfterFirst).toHaveLength(1);
+		expect(rowsAfterFirst[0]?.decisionEvaluated).toBe(true);
+
+		// Second turn_end fires while the first compaction is still pending
+		// (`selected` populated) but `pendingBoundary` was already consumed by
+		// the first turn -> the `!boundary` guard wins, matching its precedence
+		// over the `selected` check in the original `if (!boundary || selected)`.
+		// This deliberately does NOT exercise the `already_selected` bucket —
+		// see the next test for that, which requires a pending boundary AND a
+		// pending selection simultaneously.
+		await pi.emit(
+			"turn_end",
+			{ type: "turn_end", turnIndex: 2, message: assistantMessage(), toolResults: [] },
+			context,
+		);
+		const rowsAfterSecond = await readLedgerRows(sessionDir);
+		expect(rowsAfterSecond).toHaveLength(2);
+		expect(rowsAfterSecond[1]?.bucket).toBe("no_boundary");
+	});
+
+	it("records already_selected when a new boundary becomes pending while a prior decision is still pending settlement", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		// `decideCompaction`'s `window_protection` gate is necessary but not
+		// sufficient to reach `selected = { decision }`: the handler also
+		// requires `nativeCompactionFeasible(context.sessionManager.getBranch(), keepRecentTokens)`,
+		// which scans REAL session entries (not the `observedMessages` fed via
+		// `emitContext`) for anything outside the `keepRecentTokens` window.
+		// `estimateTokens` only counts a bare-string `content` for `user`-role
+		// messages (an assistant message needs the real block-array shape, or
+		// it estimates 0 tokens) — verified directly against the SDK. Three
+		// large user messages give the walk-back plenty to count as "history"
+		// even at this tiny `keepRecentTokens`.
+		for (let i = 0; i < 3; i++) {
+			manager.appendMessage({ role: "user", content: `turn ${i}: ${"x".repeat(200)}`, timestamp: Date.now() });
+		}
+		const pi = new FakePi();
+		// keepRecentTokens:10 plus a large observed message drives archiveTokens
+		// (writeTokens - fixedTokens - keepRecentTokens) well above the fixed
+		// 1,000-token memo estimate, and the small contextWindow makes
+		// `contextTokens >= contextWindow - windowReserveTokens` (16,384) hold,
+		// so `decideCompaction` returns compact:true via `window_protection`
+		// without depending on any request-horizon estimate. This is what
+		// actually makes `selected` non-empty for the second turn_end below —
+		// NOT the unused `compact()` context mock, which only ever runs on the
+		// `ompHost` path this fake harness never takes.
+		createOnlineContextCompactExtension({ keepRecentTokens: 10 })(pi.asExtensionApi());
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 5_000, contextWindow: 20_000, percent: 0.25 }),
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([assistant("x".repeat(20_000))], context);
+
+		const plan = pi.tool("update_plan");
+		await plan.execute!(
+			"plan-open",
+			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
+			undefined,
+			() => {},
+			context,
+		);
+		await plan.execute!(
+			"plan-done-1",
+			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
+			undefined,
+			() => {},
+			context,
+		);
+
+		// First turn_end: boundary pending, nothing selected yet -> evaluates,
+		// decides to compact via `window_protection` (see fixture comment
+		// above), and since this fake harness has no `ompHost`, the handler
+		// sets `selected = { decision }` and returns without ever clearing it.
+		await pi.emit(
+			"turn_end",
+			{
+				type: "turn_end",
+				turnIndex: 1,
+				message: assistantMessage(),
+				toolResults: [
+					{ role: "toolResult", toolCallId: "plan-done-1", toolName: "update_plan", content: [], isError: false, timestamp: Date.now() },
+				],
+			},
+			context,
+		);
+		const rowsAfterFirst = await readLedgerRows(sessionDir);
+		expect(rowsAfterFirst).toHaveLength(1);
+		expect(rowsAfterFirst[0]).toMatchObject({ decisionEvaluated: true, willCompact: true, reason: "window_protection" });
+
+		// Complete a SECOND plan step before the second turn_end, so a fresh
+		// `pendingBoundary` is set. This time `!boundary` is false but
+		// `selected` is still truthy from the first turn, so the
+		// `already_selected` bucket must win.
+		await plan.execute!(
+			"plan-step-2",
+			{ steps: [{ id: "s2", goal: "do more", status: "in_progress" }] },
+			undefined,
+			() => {},
+			context,
+		);
+		await plan.execute!(
+			"plan-done-2",
+			{ steps: [{ id: "s2", goal: "do more", status: "completed" }] },
+			undefined,
+			() => {},
+			context,
+		);
+		await pi.emit(
+			"turn_end",
+			{
+				type: "turn_end",
+				turnIndex: 2,
+				message: assistantMessage(),
+				toolResults: [
+					{ role: "toolResult", toolCallId: "plan-done-2", toolName: "update_plan", content: [], isError: false, timestamp: Date.now() },
+				],
+			},
+			context,
+		);
+		const rowsAfterSecond = await readLedgerRows(sessionDir);
+		expect(rowsAfterSecond).toHaveLength(2);
+		expect(rowsAfterSecond[1]).toMatchObject({ bucket: "already_selected", decisionEvaluated: false });
+	});
+
+	it("records boundary_tool_result_error and never evaluates decideCompaction when the plan tool call itself errored", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		const pi = new FakePi();
+		createOnlineContextCompactExtension()(pi.asExtensionApi());
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 1_000, contextWindow: 200_000, percent: 0.5 }),
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([], context);
+
+		const plan = pi.tool("update_plan");
+		await plan.execute!(
+			"plan-open",
+			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
+			undefined,
+			() => {},
+			context,
+		);
+		await plan.execute!(
+			"plan-done",
+			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
+			undefined,
+			() => {},
+			context,
+		);
+
+		await pi.emit(
+			"turn_end",
+			{
+				type: "turn_end",
+				turnIndex: 1,
+				message: assistantMessage(),
+				toolResults: [
+					{ role: "toolResult", toolCallId: "plan-done", toolName: "update_plan", content: [], isError: true, timestamp: Date.now() },
+				],
+			},
+			context,
+		);
+
+		const rows = await readLedgerRows(sessionDir);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ bucket: "boundary_tool_result_error", decisionEvaluated: false });
+	});
+
+	it("fails open when the session has no persistent directory, without breaking the turn's own compaction decision", async () => {
+		const manager = new FakeSessionManager([], SESSION_ID, "");
+		const pi = new FakePi();
+		createOnlineContextCompactExtension()(pi.asExtensionApi());
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 1_000, contextWindow: 200_000, percent: 0.5 }),
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([], context);
+
+		// getSessionDir() returning "" makes runtimeRoot() throw inside the ledger
+		// resolution path; the turn_end handler must still complete normally.
+		await expect(
+			pi.emit(
+				"turn_end",
+				{ type: "turn_end", turnIndex: 1, message: assistantMessage(), toolResults: [] },
+				context,
+			),
+		).resolves.not.toThrow();
+	});
+});
