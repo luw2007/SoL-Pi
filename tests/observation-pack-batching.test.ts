@@ -9,6 +9,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_CONFIG } from "../src/sol-pi/config.ts";
+import { registerConfiguredFeatures } from "../src/sol-pi/index.ts";
 import { firstChangedIndex, requestTiming } from "../src/sol-pi/extensions/observation-pack/batching.ts";
 import {
 	createObservation,
@@ -411,6 +413,25 @@ describe("observation pack cache-aware batching", () => {
 		const projected = await h.send(history(2));
 		expect(textOf(projected[resultIndex(1)])).toBe(textOf(result(1)));
 		expect(errors.some((error) => error.includes("prefix diagnostics"))).toBe(true);
+	});
+
+	it("wires the sol-pi.json batching keys through the configured entrypoint", async () => {
+		const sessionDir = await sessionRoot();
+		const pi = new FakePi();
+		registerConfiguredFeatures(pi.asExtensionApi(), {
+			...DEFAULT_CONFIG,
+			observationPack: true,
+			observationPackBatchThresholdTokens: 0,
+			observationPackPrefixDiagnostics: true,
+		});
+		let projected: AgentMessage[] = [];
+		for (let call = 0; call < 3; call += 1) projected = await pi.emitContext(history(1), fakeContext(sessionDir));
+		expect(isPlaceholder(projected[resultIndex(1)])).toBe(true);
+		const diagnostics = await readFile(
+			join(sessionDir, "sol-pi", SESSION_ID, "observation-pack", "prefix-ledger.jsonl"),
+			"utf8",
+		);
+		expect(diagnostics.trim().split("\n")).toHaveLength(3);
 	});
 
 	it("computes the first changed index and request timing", () => {
