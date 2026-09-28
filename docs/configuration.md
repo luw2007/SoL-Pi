@@ -24,11 +24,14 @@ The project file replaces the global file. SoL-Pi does not merge them.
   "evidencePreservingReducerModel": "model-id",
   "onlineContextCompact": false,
   "cacheWriteReadRatio": 12.5,
-  "keepRecentTokens": 20000
+  "keepRecentTokens": 20000,
+  "observationPackBatchThresholdTokens": 20000,
+  "observationPackColdGapMs": 300000,
+  "observationPackPrefixDiagnostics": false
 }
 ```
 
-Feature keys may be omitted and then default to `false`. `cacheWriteReadRatio` may be omitted and then defaults to `12.5`; when present it must be a finite non-negative number, and `0` explicitly means that a cache write adds no cost relative to a cache read. `keepRecentTokens` may be omitted and then defaults to `20000`; when present it must be a positive safe integer and controls the retained tail budget used by Online Context Compact feasibility checks. `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` may be omitted and then use the built-in reducer route; when present each must be a non-empty string. Unknown keys, unsupported versions, malformed JSON, non-boolean feature values, invalid ratios, invalid keep-recent budgets, and invalid reducer model fields stop extension loading with a direct error.
+Feature keys may be omitted and then default to `false`. `cacheWriteReadRatio` may be omitted and then defaults to `12.5`; when present it must be a finite non-negative number, and `0` explicitly means that a cache write adds no cost relative to a cache read. `keepRecentTokens` may be omitted and then defaults to `20000`; when present it must be a positive safe integer and controls the retained tail budget used by Online Context Compact feasibility checks. `observationPackBatchThresholdTokens` may be omitted and then defaults to `20000`; when present it must be a non-negative safe integer, and `0` restores the legacy one-by-one placeholder swap. `observationPackColdGapMs` may be omitted and then defaults to `300000`; when present it must be a positive safe integer. `observationPackPrefixDiagnostics` may be omitted and then defaults to `false`; when present it must be boolean. `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` may be omitted and then use the built-in reducer route; when present each must be a non-empty string. Unknown keys, unsupported versions, malformed JSON, non-boolean feature values, invalid ratios, invalid keep-recent budgets, invalid ObservationPack batching values, and invalid reducer model fields stop extension loading with a direct error.
 
 For the managed all-enabled installation described in the [agent installation and configuration protocol](../agents-install.md), validate the effective file before starting Pi:
 
@@ -44,6 +47,7 @@ This preflight does not make every valid SoL-Pi configuration all-enabled. Witho
 
 - `actionFusion`: registers SoL-Pi replacements for Pi's `edit` and `write` tools.
 - `observationPack`: registers `obs_recall` and a provider-context projection handler.
+- `observationPackBatchThresholdTokens`, `observationPackColdGapMs`, `observationPackPrefixDiagnostics`: tune when ObservationPack swaps pending results for placeholders; see [ObservationPack batching](#observationpack-batching).
 - `evidencePreservingReducer`: registers a `tool_result` handler and delegates long diagnostic-log reduction to the configured reducer provider/model.
 - `evidencePreservingReducerProvider`: provider namespace used to resolve the reducer model through Pi's model registry.
 - `evidencePreservingReducerModel`: model id used for Evidence-Preserving Reducer.
@@ -55,6 +59,19 @@ This preflight does not make every valid SoL-Pi configuration all-enabled. Witho
 The release entry supplies the run label and session-derived storage. It uses one configurable model route:
 
 - **Reducer provider/model** — from `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` in the effective `sol-pi.json`. If omitted, SoL-Pi uses its built-in reducer route. SoL-Pi resolves that model through Pi's model registry and still relies on Pi-managed authentication; do not put credentials in `sol-pi.json`.
+
+## ObservationPack batching
+
+A large tool result becomes eligible for its placeholder after its first two provider requests. Swapping it edits the middle of the prompt, which breaks the provider prompt cache from that point, so eligible results wait as *pending* and are still sent in full. All pending results of a session swap together on the first request where one of these holds:
+
+- **threshold** — the pending results would remove at least `observationPackBatchThresholdTokens` tokens in total;
+- **cold-gap** — at least `observationPackColdGapMs` passed since the most recent assistant message, so the cache is likely cold;
+- **model-change** — the current model differs from the one that produced the most recent assistant message (skipped when the host does not expose the current model);
+- **process-start** — the first request of a session in this process (restart or resume).
+
+When the projected history changed before its end since the previous request (compaction, native pruning, another extension's rewrite), the cache already breaks at the first changed message, so only pending results at or after that message swap (**prefix-changed**). A swapped result stays a placeholder for every later request. The placeholder text is unchanged. `observationPackBatchThresholdTokens: 0` restores the original behavior: every result swaps on its own third request.
+
+The ledger at `<session runtime directory>/observation-pack/ledger.jsonl` records the reason on the first `placeholder` row of each result (`flushReason`: `threshold`, `cold-gap`, `model-change`, `prefix-changed`, `process-start`, or `legacy` when the threshold is `0`) and marks pending results sent in full with `"deferred": true`. A repeated `context` call for the same request adds no duplicate rows. With `observationPackPrefixDiagnostics: true`, each `context` call also appends one row to `observation-pack/prefix-ledger.jsonl` with the request number, message counts, first changed index, gap, model change, repeat flag, pending count and tokens, and the flush decision.
 
 ## Online Context Compact runtime inputs
 The release entry uses three runtime inputs:
