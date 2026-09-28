@@ -187,6 +187,40 @@ describe("observation pack cache-aware batching", () => {
 		expect(new Set(flushedIds).size).toBe(flushedIds.length);
 	});
 
+	it("keeps a swapped observation as a placeholder after a rewind leaves fewer assistants after it", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		expect(isPlaceholder((await sendSteps(h, 1, 3))[resultIndex(1)])).toBe(true);
+		const rewound = await h.send([...history(1), assistant(2_000, "retry from checkpoint")]);
+		expect(isPlaceholder(rewound[resultIndex(1)])).toBe(true);
+	});
+
+	it("ignores context calls without an assistant message for prefix tracking (omp live steering)", async () => {
+		const h = await harness({ batchThresholdTokens: 1_000_000, prefixDiagnostics: true });
+		await sendSteps(h, 1, 4); // results 1 and 2 are pending
+		await h.send([user("steer: also check the tests")]);
+		const projected = await h.send([...history(4), user("steer: also check the tests"), assistant(5_000), result(5)]);
+		expect([1, 2].map((step) => isPlaceholder(projected[resultIndex(step)]))).toEqual([false, false]);
+		expect((await h.ledger()).filter((row) => row.flushReason !== undefined)).toEqual([]);
+		const rows = await h.prefixLedger();
+		expect(rows.map((row) => [row.continuation, row.firstChangedIndex, row.flush])).toEqual([
+			[true, null, false],
+			[true, null, false],
+			[true, null, false],
+			[true, null, false],
+			[false, null, false],
+			[true, null, false],
+		]);
+		expect(rows[5]?.prevMessageCount).toBe(history(4).length);
+	});
+
+	it("does not re-log an (event, id, request) row when a request number repeats non-consecutively", async () => {
+		const h = await harness({ batchThresholdTokens: 1_000_000 });
+		for (const steps of [1, 2, 1, 2]) await h.send(history(steps));
+		const keys = (await h.ledger()).map((row) => `${row.event}:${row.id}:${row.request}`);
+		expect(keys).toHaveLength(3);
+		expect(new Set(keys).size).toBe(keys.length);
+	});
+
 	it("does not advance counts or duplicate ledger rows on a repeated context call", async () => {
 		const h = await harness({ batchThresholdTokens: 1 });
 		const once = await h.send(history(1));

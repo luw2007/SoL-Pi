@@ -65,6 +65,9 @@ const RECALL_LIMITS = {
 	maxLines: RECALL_MAX_LINES - RECALL_HEADER_LINES,
 };
 
+/** Ledger de-dup keys kept per root; the oldest are dropped past this bound (a dropped key may be logged again). */
+const LOGGED_KEYS_MAX = 100_000;
+
 export interface ObservationPackOptions {
 	/** Σ removable pending tokens that triggers a batch swap; `0` keeps the legacy immediate swap. */
 	readonly batchThresholdTokens?: number;
@@ -80,9 +83,8 @@ export interface ObservationPackOptions {
 interface RootState {
 	/** Observations already sent as placeholders; they never flip back to full text. */
 	readonly placeholders: Set<string>;
-	/** Ledger rows written for `loggedRequest`, so a repeated `context` call adds no duplicates. */
+	/** (event, id, request) ledger keys already written, so repeated `context` calls add no duplicates. */
 	readonly logged: Set<string>;
-	loggedRequest: number;
 	/** What the previous request of this root sent, for prefix-change detection. */
 	previous?: { readonly request: number; readonly fingerprints: readonly string[] };
 }
@@ -103,6 +105,7 @@ interface Candidate {
 
 /** Signals computed from the projection this root sends before any new swap. */
 interface RequestView {
+	readonly continuation: boolean;
 	readonly fingerprints: string[];
 	readonly previous: RootState["previous"];
 	readonly firstChanged: number | undefined;
@@ -137,7 +140,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 		const stateFor = (root: string): RootState => {
 			let state = states.get(root);
 			if (!state) {
-				state = { placeholders: new Set(), logged: new Set(), loggedRequest: 0 };
+				state = { placeholders: new Set(), logged: new Set() };
 				states.set(root, state);
 			}
 			return state;
@@ -147,19 +150,34 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			state: RootState,
 			entry: { readonly event: string; readonly id: string; readonly request: number } & Record<string, unknown>,
 		): Promise<void> => {
-			if (state.loggedRequest !== entry.request) {
-				state.loggedRequest = entry.request;
-				state.logged.clear();
-			}
-			const key = `${entry.event}\0${entry.id}`;
+			const key = `${entry.event}\0${entry.id}\0${entry.request}`;
 			if (state.logged.has(key)) return;
-			await ledgerAt(root, "ledger.jsonl")(entry);
+			// Reserve the key before the write so a concurrent call for the same request cannot log it twice.
 			state.logged.add(key);
+			if (state.logged.size > LOGGED_KEYS_MAX) state.logged.delete(state.logged.values().next().value as string);
+			try {
+				await ledgerAt(root, "ledger.jsonl")(entry);
+			} catch (error) {
+				state.logged.delete(key);
+				throw error;
+			}
 		};
-		const inspectRequest = (state: RootState, sent: readonly AgentMessage[], ctx: ExtensionContext): RequestView => {
+		/**
+		 * `continuation` is false for a call without any assistant message (e.g. omp live
+		 * steering converts only the newly typed messages). Such a call is not part of
+		 * the root's request stream, and it cannot hold an eligible observation: it is
+		 * neither compared with nor recorded as the previous request.
+		 */
+		const inspectRequest = (
+			state: RootState,
+			sent: readonly AgentMessage[],
+			ctx: ExtensionContext,
+			continuation: boolean,
+		): RequestView => {
 			const fingerprints = sent.map(messageFingerprint);
-			const previous = state.previous;
+			const previous = continuation ? state.previous : undefined;
 			return {
+				continuation,
 				fingerprints,
 				previous,
 				firstChanged: previous ? firstChangedIndex(previous.fingerprints, fingerprints) : undefined,
@@ -183,6 +201,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 					gapMs: view.timing.gapMs ?? null,
 					modelChanged: view.timing.modelChanged,
 					repeat: view.previous?.request === request,
+				continuation: view.continuation,
 					pendingCount: pending.count,
 					pendingTokens: pending.tokens,
 					flush: flushedCount > 0,
@@ -273,6 +292,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			state: RootState,
 			priorAssistantCounts: readonly number[],
 			requestIndex: number,
+			continuation: boolean,
 		): Promise<AgentMessage[]> => {
 			const projected = [...messages];
 			const swapped: number[] = [];
@@ -343,9 +363,9 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 				try {
 					const beforeSwap = [...projected];
 					for (const index of swapped) beforeSwap[index] = messages[index] as AgentMessage;
-					const view = inspectRequest(state, beforeSwap, ctx);
+					const view = inspectRequest(state, beforeSwap, ctx, continuation);
 					await writeDiagnostics(root, requestIndex, view, { count: 0, tokens: 0 }, "legacy", swapped.length);
-					state.previous = { request: requestIndex, fingerprints: projected.map(messageFingerprint) };
+					if (continuation) state.previous = { request: requestIndex, fingerprints: projected.map(messageFingerprint) };
 				} catch (error) {
 					failOpen(error, "prefix diagnostics");
 				}
@@ -360,20 +380,24 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			state: RootState,
 			priorAssistantCounts: readonly number[],
 			requestIndex: number,
+			continuation: boolean,
 		): Promise<AgentMessage[]> => {
 			// Classify every large result. The send count is derived from history,
 			// so a repeated `context` call for the same request cannot advance it.
+			// An already-swapped observation stays a placeholder whatever the count
+			// (a rewind or tree navigation can leave fewer assistants after it).
 			const candidates: Candidate[] = [];
 			for (let index = 0; index < messages.length; index += 1) {
 				const message = messages[index];
-				if (!message || !isPureTextResult(message)) continue;
 				try {
+					if (!message || !isPureTextResult(message)) continue;
 					const observation = createObservation(message, root);
 					if (!observation) continue;
 					await ensureStored(observation);
 					const previousSends = priorAssistantCounts[index] ?? 0;
 					const sendNumber = previousSends + 1;
-					if (previousSends < FULL_SENDS) {
+					const swapped = state.placeholders.has(observation.id);
+					if (!swapped && previousSends < FULL_SENDS) {
 						candidates.push({ index, observation, sendNumber, kind: "full" });
 						continue;
 					}
@@ -383,7 +407,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 						index,
 						observation,
 						sendNumber,
-						kind: state.placeholders.has(observation.id) ? "placeholder" : "pending",
+						kind: swapped ? "placeholder" : "pending",
 						swap: {
 							message: { ...message, content: [{ type: "text", text }] },
 							bytes: Buffer.byteLength(text, "utf8"),
@@ -407,9 +431,12 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			let flushReason: FlushReason | undefined;
 			let flushing = new Set<number>();
 			try {
-				view = inspectRequest(state, beforeFlush, ctx);
+				view = inspectRequest(state, beforeFlush, ctx, continuation);
 				const { gapMs, modelChanged } = view.timing;
-				const flushAll: FlushReason | undefined = !view.previous
+				// A non-continuation call has no assistant, hence no eligible observation: nothing to flush.
+				const flushAll: FlushReason | undefined = !continuation
+					? undefined
+					: !view.previous
 					? "process-start"
 					: modelChanged
 						? "model-change"
@@ -421,7 +448,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 				if (flushAll) {
 					flushReason = flushAll;
 					flushing = new Set(pending.map((candidate) => candidate.index));
-				} else if (view.firstChanged !== undefined) {
+				} else if (continuation && view.firstChanged !== undefined) {
 					// The cache already breaks at firstChanged; swapping anything earlier would move the break up.
 					const from = view.firstChanged;
 					flushReason = "prefix-changed";
@@ -454,24 +481,31 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 						});
 						continue;
 					}
-					const first = candidate.kind === "pending";
-					await recordOnce(root, state, {
-						event: "placeholder",
-						id: observation.id,
-						request: requestIndex,
-						sendNumber,
-						tool: observation.toolName,
-						originalBytes: observation.bytes,
-						originalLines: observation.lines,
-						originalTokens: observation.tokens,
-						placeholderBytes: swap.bytes,
-						placeholderTokens: swap.tokens,
-						removedTokens: swap.removedTokens,
-						...(first ? { flushReason } : {}),
-					});
+					// Decide "first" and reserve the placeholder before any await so a concurrent
+					// call for the same root neither re-flushes nor re-toasts this observation.
+					const first = !state.placeholders.has(observation.id);
+					if (first) state.placeholders.add(observation.id);
+					try {
+						await recordOnce(root, state, {
+							event: "placeholder",
+							id: observation.id,
+							request: requestIndex,
+							sendNumber,
+							tool: observation.toolName,
+							originalBytes: observation.bytes,
+							originalLines: observation.lines,
+							originalTokens: observation.tokens,
+							placeholderBytes: swap.bytes,
+							placeholderTokens: swap.tokens,
+							removedTokens: swap.removedTokens,
+							...(first ? { flushReason } : {}),
+						});
+					} catch (error) {
+						if (first) state.placeholders.delete(observation.id);
+						throw error;
+					}
 					projected[index] = swap.message;
 					if (first) {
-						state.placeholders.add(observation.id);
 						flushedCount += 1;
 						showSolPiSavings(
 							ctx,
@@ -491,7 +525,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 					for (const { index } of candidates) {
 						if (projected[index] !== beforeFlush[index]) fingerprints[index] = messageFingerprint(projected[index]);
 					}
-					state.previous = { request: requestIndex, fingerprints };
+					if (continuation) state.previous = { request: requestIndex, fingerprints };
 				} catch (error) {
 					failOpen(error, "observation batching");
 				}
@@ -510,7 +544,13 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 		};
 
 		pi.on("context", async (event, ctx: ExtensionContext) => {
-			const root = runtimeRoot(ctx);
+			let root: string;
+			try {
+				root = runtimeRoot(ctx);
+			} catch (error) {
+				failOpen(error, "context");
+				return undefined;
+			}
 			const state = stateFor(root);
 			// How many provider requests each message has already been part of,
 			// counted by the assistant messages that follow it.
@@ -523,8 +563,11 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			}
 
 			const requestIndex = assistantCount + 1;
+			const continuation = assistantCount > 0;
 			const project = batchThresholdTokens === 0 ? projectLegacy : projectBatched;
-			return { messages: await project(event.messages, ctx, root, state, priorAssistantCounts, requestIndex) };
+			return {
+				messages: await project(event.messages, ctx, root, state, priorAssistantCounts, requestIndex, continuation),
+			};
 		});
 	};
 }

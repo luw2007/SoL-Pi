@@ -68,6 +68,7 @@ export function isPureTextResult(message: AgentMessage): message is ToolResultMe
 	return (
 		message.role === "toolResult" &&
 		!message.isError &&
+		Array.isArray(message.content) &&
 		message.content.length > 0 &&
 		message.content.every((block) => block.type === "text")
 	);
