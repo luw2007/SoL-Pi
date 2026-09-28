@@ -10,6 +10,8 @@
  * the `it.fails` as failing, which is the cue to turn it into a plain `it`.
  * Round 0 defects (R1, R2, R4, R5) are fixed and their tests are plain `it`.
  * Round 1 additions are in the "round 1" describe blocks at the end.
+ * Round 2 additions (against 7251819) are in the "round 2" describe blocks; the
+ * it.fails there is R9 (main request misclassified as an omp side turn).
  */
 import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -714,4 +716,360 @@ describe("round 1: scale and state growth", () => {
 		// One ledger row (and one de-dup key) per (observation, request): quadratic in session length, capped at 100k keys per root.
 		expect(batched.rows).toBeLessThan(120 * 121);
 	}, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// Round 2 (against 7251819): warming-aware cold gap and omp side turns.
+// ---------------------------------------------------------------------------
+
+type OmpEntry = Record<string, unknown> & { id: string; parentId: string | null; type: string; timestamp: string };
+
+/**
+ * Session manager shaped like omp 18.3.5 `SessionManager` for the parts ObservationPack reads:
+ * Map-backed getEntry, getLeafEntry, and appendModelUsage that (like omp) moves the leaf onto the
+ * usage entry when parentId is the current leaf, and keeps the leaf otherwise.
+ */
+class OmpSessionManager {
+	readonly entries = new Map<string, OmpEntry>();
+	leafId: string | null = null;
+	private next = 1;
+	constructor(
+		readonly sessionDir: string,
+		readonly sessionId = SESSION_ID,
+	) {}
+	getSessionId(): string {
+		return this.sessionId;
+	}
+	getSessionDir(): string {
+		return this.sessionDir;
+	}
+	getSessionFile(): string {
+		return join(this.sessionDir, `${this.sessionId}.jsonl`);
+	}
+	getLeafId(): string | null {
+		return this.leafId;
+	}
+	getLeafEntry(): OmpEntry | undefined {
+		return this.leafId === null ? undefined : this.entries.get(this.leafId);
+	}
+	getEntry(id: string): OmpEntry | undefined {
+		return this.entries.get(id);
+	}
+	getEntries(): OmpEntry[] {
+		return [...this.entries.values()];
+	}
+	getBranch(): OmpEntry[] {
+		const branch: OmpEntry[] = [];
+		for (let entry = this.getLeafEntry(); entry; entry = entry.parentId ? this.entries.get(entry.parentId) : undefined) branch.unshift(entry);
+		return branch;
+	}
+	private push(entry: Omit<OmpEntry, "id" | "parentId">, parentId = this.leafId, at = Date.now()): string {
+		const id = `e${this.next++}`;
+		this.entries.set(id, { ...entry, id, parentId, timestamp: new Date(at).toISOString() } as OmpEntry);
+		this.leafId = id;
+		return id;
+	}
+	appendMessage(message: AgentMessage): string {
+		return this.push({ type: "message", message } as never);
+	}
+	/** omp `appendModelUsage({purpose, api, provider, model, usage, stopReason}, {sessionId, parentId})`. */
+	appendModelUsage(at: number, usage: Record<string, unknown>, purpose = "cache-warm"): string {
+		const leaf = this.leafId;
+		const id = this.push(
+			{ type: "model_usage", purpose, api: "anthropic-messages", provider: PROVIDER, model: MODEL, usage, stopReason: "length" } as never,
+			leaf,
+			at,
+		);
+		return id;
+	}
+	/** /tree navigation: move the leaf to an earlier entry. */
+	navigate(id: string): void {
+		this.leafId = id;
+	}
+}
+
+const warmUsage = (cacheRead: unknown, cacheWrite: unknown = 0) => ({
+	input: 3,
+	output: 1,
+	cacheRead,
+	cacheWrite,
+	totalTokens: 4,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+});
+
+const MINUTE = 60_000;
+
+describe("round 2: warming-aware cold gap through the real hook (omp entry shapes)", () => {
+	/** Main stream up to history(2); returns the manager with the leaf on the third assistant. */
+	async function warmedSession(h: Harness): Promise<OmpSessionManager> {
+		const manager = new OmpSessionManager(h.sessionDir);
+		for (let steps = 1; steps <= 2; steps += 1) {
+			manager.appendMessage(assistant(steps * 1_000));
+			manager.appendMessage(result(steps) as AgentMessage);
+			await h.send(history(steps), { sessionManager: manager as never });
+		}
+		manager.appendMessage(assistant(3_000));
+		return manager;
+	}
+
+	it("an omp 'cache-warm' refresh 2 min before a 20 min-idle request prevents the cold-gap flush", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		manager.appendModelUsage(3_000 + 18 * MINUTE, warmUsage(40_000));
+		manager.appendMessage(user("next"));
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(false);
+		expect((await h.ledger()).filter((row) => row.flushReason)).toEqual([]);
+	});
+
+	it("control: without the refresh the same request flushes with cold-gap", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		manager.appendMessage(user("next"));
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(true);
+		expect((await h.ledger()).flatMap((row) => (row.flushReason ? [row.flushReason] : []))).toEqual(["cold-gap"]);
+	});
+
+	it("a refresh left on an abandoned branch (after /tree navigation) does not count", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		const branchPoint = manager.leafId as string;
+		manager.appendMessage(user("abandoned"));
+		manager.appendModelUsage(3_000 + 18 * MINUTE, warmUsage(40_000));
+		manager.navigate(branchPoint);
+		manager.appendMessage(user("other branch"));
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(true);
+	});
+
+	it("a refresh older than the last assistant in event.messages cannot lengthen the gap (session persistence lag)", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		// The branch still ends at an old refresh, but the in-memory context already has a newer assistant.
+		manager.appendModelUsage(3_500, warmUsage(40_000));
+		// 299.8 s after the last assistant (no cold gap), 300.3 s after the refresh (would be cold if used).
+		h.clock.now = 4_000 + 300_000 - 200;
+		const out = await h.pi.emitContext(history(4), h.context({ sessionManager: manager as never }));
+		expect([1, 2].map((step) => isPlaceholder(out[resultIndex(step)]))).toEqual([false, false]);
+		expect((await h.ledger()).filter((row) => row.flushReason)).toEqual([]);
+	});
+
+	it.each([
+		["usage cacheRead NaN", { usage: warmUsage(Number.NaN) }],
+		["usage cacheRead string", { usage: warmUsage("40000") }],
+		["usage missing", { usage: undefined }],
+		["usage null", { usage: null }],
+		["timestamp not a date", { timestamp: "yesterday" }],
+		["timestamp as number", { timestamp: 3_000 + 18 * MINUTE }],
+		["purpose not a string", { purpose: 7 }],
+	])("malformed warm entry (%s) never throws and never suppresses a cold-gap flush wrongly", async (_label, patch) => {
+		const errors = silenceFailOpen();
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		const id = manager.appendModelUsage(3_000 + 18 * MINUTE, warmUsage(40_000));
+		Object.assign(manager.entries.get(id) as OmpEntry, patch);
+		manager.appendMessage(user("next"));
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		// A string "40000" is coerced by Number(); only that variant legitimately counts as a warm refresh.
+		const counted = _label === "usage cacheRead string";
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(!counted);
+		expect(errors).toEqual([]);
+	});
+
+	it.each([
+		["getLeafEntry returns a string", (m: OmpSessionManager) => Object.assign(m, { getLeafEntry: () => "leaf" })],
+		["getLeafEntry returns a number", (m: OmpSessionManager) => Object.assign(m, { getLeafEntry: () => 42 })],
+		[
+			"getEntry throws",
+			(m: OmpSessionManager) =>
+				Object.assign(m, {
+					getEntry: () => {
+						throw new Error("entry store closed");
+					},
+				}),
+		],
+		[
+			"cyclic parent chain",
+			(m: OmpSessionManager) => {
+				const leaf = m.getLeafEntry() as OmpEntry;
+				leaf.parentId = leaf.id;
+				return m;
+			},
+		],
+		["getEntry is not a function", (m: OmpSessionManager) => Object.assign(m, { getEntry: 1 })],
+		[
+			"getLeafEntry is a throwing getter",
+			(m: OmpSessionManager) =>
+				Object.defineProperty(m, "getLeafEntry", {
+					get() {
+						throw new Error("disposed");
+					},
+				}),
+		],
+	])("hostile session manager (%s): no throw, falls back to the assistant-based gap", async (_label, mutate) => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		manager.appendMessage(user("next"));
+		mutate(manager);
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(true);
+	});
+
+	it("a long run of non-assistant entries after the last assistant is scanned in bounded time", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = await warmedSession(h);
+		manager.appendModelUsage(3_000 + 18 * MINUTE, warmUsage(40_000));
+		for (let index = 0; index < 20_000; index += 1) manager.appendModelUsage(3_000 + 18 * MINUTE, warmUsage(0), "auto-thinking");
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const started = performance.now();
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		expect(performance.now() - started).toBeLessThan(2_000);
+		// Beyond the 256-entry scan window the refresh is not found: the assistant gap applies (documents the bound).
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(true);
+	});
+
+	it("documents: a refresh stamped in the future (clock skew) yields a negative gap and no cold-gap flush", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000, prefixDiagnostics: true });
+		const manager = await warmedSession(h);
+		manager.appendModelUsage(3_000 + 60 * MINUTE, warmUsage(40_000));
+		h.clock.now = 3_000 + 20 * MINUTE;
+		const out = await h.pi.emitContext(history(3), h.context({ sessionManager: manager as never }));
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(false);
+		const rows = (await readFile(join(h.packDir, "prefix-ledger.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		expect(rows.at(-1).gapMs).toBeLessThan(0);
+	});
+});
+
+/** An assistant as the host records it after an abort or error: text-only (or empty) content and zero usage. */
+function interruptedAssistant(stopReason: "aborted" | "error", content: unknown[], timestamp: number): AgentMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "openai-responses",
+		provider: PROVIDER,
+		model: MODEL,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} },
+		stopReason,
+		timestamp,
+	} as unknown as AgentMessage;
+}
+
+function developer(text: string, timestamp: number): AgentMessage {
+	return { role: "developer", content: [{ type: "text", text }], attribution: "agent", timestamp } as unknown as AgentMessage;
+}
+
+describe("round 2: omp side-turn detection false positives on the main stream", () => {
+	// omp appends developer messages to the MAIN stream (todo reminder, empty/unexpected-stop retry,
+	// checkpoint reminder, plan-mode reminder, synthetic prompts). If the next provider response is
+	// aborted (Esc) before any usage arrives (OpenAI Responses reports usage only at completion) or
+	// fails with an error, the host keeps a text-only/empty, zero-usage assistant. A user prompt then
+	// yields [..., developer, assistant(zero usage), user], which sideTurnStart classifies as a /btw
+	// side turn. Real omp data: 4 of 54,318 user prompts in ~/.omp/agent/sessions match this shape
+	// (developer -> aborted x3 / error x1 -> user).
+	it.fails.each([
+		["aborted with partial text", interruptedAssistant("aborted", [{ type: "text", text: "Let me" }], 2_500)],
+		["error with empty content", interruptedAssistant("error", [], 2_500)],
+	])(
+		"DEFECT(low): a main request after developer + %s is still treated as a request (counted send, threshold flush)",
+		async (_label, interrupted) => {
+			const h = await harness({ batchThresholdTokens: 1, prefixDiagnostics: true });
+			await sendSteps(h, 1, 2); // r1 sent twice (a2 + ...), r2 once
+			// Main stream: todo reminder -> response interrupted (r1's 3rd provider request) -> user types.
+			const messages = [...history(2), developer("<system-reminder>You stopped with 1 incomplete todo</system-reminder>", 2_400), interrupted, user("never mind, do X")];
+			const out = await h.send(messages);
+			// r1 has been part of a2's and the interrupted request: 3rd send, eligible, threshold 1 -> placeholder.
+			expect(isPlaceholder(out[resultIndex(1)])).toBe(true);
+			const rows = (await readFile(join(h.packDir, "prefix-ledger.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+			expect(rows.at(-1)).toMatchObject({ continuation: true, request: 4 });
+		},
+	);
+
+	it("legacy T=0 (no side-turn detection) swaps r1 on that same request (reference)", async () => {
+		const h = await harness({ batchThresholdTokens: 0 });
+		await sendSteps(h, 1, 2);
+		const out = await h.send([...history(2), developer("reminder", 2_400), interruptedAssistant("aborted", [{ type: "text", text: "Let me" }], 2_500), user("x")]);
+		expect(isPlaceholder(out[resultIndex(1)])).toBe(true);
+	});
+
+	it("the misclassification lasts one request: the next main request swaps r1 (bounded impact)", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 2);
+		const base = [...history(2), developer("reminder", 2_400), interruptedAssistant("aborted", [{ type: "text", text: "Let me" }], 2_500), user("x")];
+		await h.send(base);
+		const next = await h.send([...base, assistant(3_000), result(3)]);
+		expect(isPlaceholder(next[resultIndex(1)])).toBe(true);
+	});
+});
+
+describe("round 2: side turns, robustness", () => {
+	it("repeated /btw follow-ups (k = 1..5 answers) between main requests never swap early and never cause a prefix flush", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000, prefixDiagnostics: true });
+		await sendSteps(h, 1, 2);
+		for (let steps = 2; steps <= 6; steps += 1) {
+			for (let k = 1; k <= 5; k += 1) await h.send(btwContext(history(steps), k, steps * 1_000 + 500));
+			const main = await h.send(history(steps + 1));
+			// Nothing swaps: below threshold, no cold gap, no model change, no prefix change.
+			expect(main.filter((message) => message.role === "toolResult" && isPlaceholder(message))).toEqual([]);
+		}
+		const rows = (await readFile(join(h.packDir, "prefix-ledger.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		expect(rows.filter((row) => row.continuation === true && row.firstChangedIndex !== null)).toEqual([]);
+		expect(rows.filter((row) => row.continuation === false).length).toBe(25);
+		expect((await h.ledger()).filter((row) => row.flushReason)).toEqual([]);
+	});
+
+	it("a /btw with answers as the FIRST call in a fresh process neither flushes nor toasts; the next main request flushes process-start", async () => {
+		const dir = await sessionRoot();
+		const first = await harness({ batchThresholdTokens: 100_000 }, dir);
+		await sendSteps(first, 1, 3);
+		const h = await harness({ batchThresholdTokens: 100_000 }, dir);
+		const toasts = vi.fn();
+		const ui = { ui: { notify: toasts, setStatus: toasts, setWidget: toasts } as never, hasUI: true };
+		const side = await h.send(btwContext(history(4), 2, 4_500), ui);
+		expect(side.filter((message) => message.role === "toolResult" && isPlaceholder(message))).toEqual([]);
+		const main = await h.send(history(5), ui);
+		expect([1, 2, 3].map((step) => isPlaceholder(main[resultIndex(step)]))).toEqual([true, true, true]);
+		const reasons = (await h.ledger()).flatMap((row) => (row.flushReason ? [row.flushReason] : []));
+		expect(reasons.filter((reason) => reason === "process-start").length).toBe(3);
+	});
+
+	it("side-turn detection over hostile message arrays (null entries, non-array content, null usage) does not throw", async () => {
+		const errors = silenceFailOpen();
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 3);
+		const shapes: unknown[][] = [
+			[...history(3), null, developer("d", 1), user("q"), assistant(1), user("q2")],
+			[...history(3), developer("d", 1), user("q"), { role: "assistant", content: "plain string", usage: null }, user("q2")],
+			[...history(3), developer("d", 1), user("q"), { role: "assistant", content: [null], usage: { input: "0" } }, user("q2")],
+			[...history(3), developer("d", 1), user("q"), { role: "assistant", content: [], usage: { input: Number.NaN } }, user("q2")],
+			[developer("d", 1), user("q"), assistant(1), user("q2")],
+		];
+		for (const messages of shapes) {
+			const out = await h.pi.emitContext(messages as AgentMessage[], h.context());
+			expect(out.length).toBe(messages.length);
+		}
+		expect(errors.every((line) => line.includes("[observationpack] fail-open"))).toBe(true);
+	});
+
+	it("documents: a /btw while idle logs a deferred full row under the NEXT main request number, which then also gets the placeholder row", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 2); // requests 2 and 3; request 3's answer is a final assistant
+		const idle = [...history(2), assistant(2_500, "final answer")];
+		await h.send(btwContext(idle, 1, 2_600)); // side turn: request number 4 (3 main assistants + 1)
+		const main = await h.send([...idle, user("next task")]); // main request 4
+		expect(isPlaceholder(main[resultIndex(1)])).toBe(true);
+		const rows = await h.ledger();
+		const r1Id = rows.find((row) => row.event === "full")?.id;
+		const r1 = rows.filter((row) => row.request === 4 && row.id === r1Id);
+		// The same (id, request 4) carries a deferred full row (side turn) and the placeholder row (main request).
+		expect(r1.map((row) => [row.event, row.deferred ?? false])).toEqual([
+			["full", true],
+			["placeholder", false],
+		]);
+	});
 });
