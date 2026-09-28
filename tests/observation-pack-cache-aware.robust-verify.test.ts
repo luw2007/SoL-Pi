@@ -8,6 +8,8 @@
  * Tests marked `it.fails` document confirmed defects: they assert the behaviour
  * the spec requires and currently fail. Once a defect is fixed, vitest reports
  * the `it.fails` as failing, which is the cue to turn it into a plain `it`.
+ * Round 0 defects (R1, R2, R4, R5) are fixed and their tests are plain `it`.
+ * Round 1 additions are in the "round 1" describe blocks at the end.
  */
 import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -554,4 +556,162 @@ describe("scale", () => {
 		console.info(`[verify] 2000-msg context: first ${first.toFixed(0)} ms, repeat ${repeat.toFixed(0)} ms`);
 		expect(repeat).toBeLessThan(5_000);
 	}, 60_000);
+});
+
+/** omp runEphemeralTurn (/btw) context: main history + [developer, (user q, assistant a)*k, user q]. */
+function btwContext(main: readonly AgentMessage[], previousAnswers: number, stamp: number): AgentMessage[] {
+	const side: AgentMessage[] = [
+		...main,
+		{ role: "developer", content: [{ type: "text", text: "side question rules" }], attribution: "agent", timestamp: stamp } as unknown as AgentMessage,
+	];
+	for (let index = 0; index < previousAnswers; index += 1) {
+		side.push(user(`btw question ${index}`), assistant(stamp, `btw answer ${index}`));
+	}
+	side.push(user("btw question now"));
+	return side;
+}
+
+describe("round 1: omp side turns on the main root (/btw, runEphemeralTurn)", () => {
+	// omp session.runEphemeralTurn -> convertMessagesToLlm -> transformContext runs the
+	// context hook of the MAIN session root with [...messages, developer, ...btw history, user].
+	// /btw follow-ups carry earlier side answers as synthetic assistant messages, so every
+	// main observation appears with k extra assistants after it. The history-derived count
+	// then makes a result eligible (and flushable) in the side call although the main stream
+	// has sent it fewer than FULL_SENDS times; the side call's swap is monotonic, so the next
+	// MAIN request sends that result as a placeholder at its 2nd main send (B1) and edits the
+	// main prompt on a warm request. Pre-existing class: 0bff376 advanced sentCounts on every
+	// side call, which is worse (k = 0 already triggered it).
+	// Fixed in round 2 (R7): batched mode recognises the side-turn suffix, counts only main
+	// assistants and neither flushes nor updates the previous request on it.
+	it("a /btw follow-up with two earlier answers does not swap a result the main stream sent only once", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 2); // r1 sent twice, r2 sent once on the main stream
+		await h.send(btwContext(history(2), 2, 3_000));
+		const main = await h.send(history(3)); // r2's second main send
+		expect(isPlaceholder(main[resultIndex(2)])).toBe(false);
+	});
+
+	it("a first /btw question (no earlier answers) does not swap anything early on the main stream", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 2);
+		await h.send(btwContext(history(2), 0, 3_000));
+		const main = await h.send(history(3));
+		expect(isPlaceholder(main[resultIndex(1)])).toBe(true); // eligible on main anyway (T=1)
+		expect(isPlaceholder(main[resultIndex(2)])).toBe(false);
+		expect(isPlaceholder(main[resultIndex(3)])).toBe(false);
+	});
+
+	it("a /btw during streaming (partial assistant appended) does not cause a prefix flush on the next main request", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		await sendSteps(h, 1, 4);
+		const partial = assistant(5_000, "partial answer so far");
+		await h.send([...btwContext([...history(4), partial], 0, 5_500)]);
+		const projected = await h.send(history(5));
+		expect([1, 2, 3].map((step) => isPlaceholder(projected[resultIndex(step)]))).toEqual([false, false, false]);
+		expect((await h.ledger()).filter((row) => row.flushReason)).toEqual([]);
+	});
+});
+
+describe("round 1: concurrency and repeats after the fix", () => {
+	it("interleaved concurrent calls for different requests neither throw, duplicate rows, nor toast twice", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		const notify = vi.fn();
+		const tui = { mode: "tui", hasUI: true, ui: { notify, setStatus: vi.fn() } as never } as Partial<ExtensionContext>;
+		await sendSteps(h, 1, 2);
+		h.clock.now = 10_000;
+		const [three, four, threeAgain] = await Promise.all([
+			h.pi.emitContext(history(3), h.context(tui)),
+			h.pi.emitContext(history(4), h.context(tui)),
+			h.pi.emitContext(history(3), h.context(tui)),
+		]);
+		expect(isPlaceholder(three[resultIndex(1)])).toBe(true);
+		expect(isPlaceholder(threeAgain[resultIndex(1)])).toBe(true);
+		expect([1, 2].map((step) => isPlaceholder(four[resultIndex(step)]))).toEqual([true, true]);
+		const rows = await h.ledger();
+		const keys = rows.map((row) => `${row.event}:${row.id}:${row.request}`);
+		expect(new Set(keys).size).toBe(keys.length);
+		const flushIds = rows.filter((row) => row.flushReason).map((row) => row.id);
+		expect(new Set(flushIds).size).toBe(flushIds.length);
+		expect(notify).toHaveBeenCalledTimes(flushIds.length);
+		// Later requests keep both placeholders (monotonic).
+		const later = await h.send(history(5));
+		expect([1, 2].map((step) => isPlaceholder(later[resultIndex(step)]))).toEqual([true, true]);
+	});
+
+	it("many live-steering calls between two requests never flush and never grow the prefix state", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000, prefixDiagnostics: true });
+		await sendSteps(h, 1, 4);
+		for (let index = 0; index < 20; index += 1) await h.send([user(`steer ${index}`)]);
+		const projected = await h.send([...history(4), user("steer 19"), assistant(5_000), result(5)]);
+		expect([1, 2, 3].map((step) => isPlaceholder(projected[resultIndex(step)]))).toEqual([false, false, false]);
+		const diagnostics = (await readFile(join(h.packDir, "prefix-ledger.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const steering = diagnostics.filter((row) => row.continuation === false);
+		expect(steering).toHaveLength(20);
+		for (const row of steering) expect(row).toMatchObject({ flush: false, prevMessageCount: null, firstChangedIndex: null });
+		expect(diagnostics.at(-1)).toMatchObject({ continuation: true, firstChangedIndex: null, flush: false });
+	});
+
+	it("a zero-assistant call with a large tool result (odd host shape) sends it in full and does not throw", async () => {
+		const errors = silenceFailOpen();
+		const h = await harness({ batchThresholdTokens: 1 });
+		const projected = await h.send([user("start"), result(1), result(2)]);
+		expect(textOf(projected[1])).toBe(textOf(result(1)));
+		expect(errors).toEqual([]);
+	});
+});
+
+describe("round 1: ledger after compaction and rewind", () => {
+	// B6 dedup is process-wide on (event, id, request). The request number is the
+	// assistant count + 1, so after compaction it repeats; a real re-send of the same
+	// observation under a request number it already used gets no ledger row.
+	it("documents: after compaction a placeholder re-sent under an already-used request number gets no new ledger row", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 8);
+		const before = (await h.ledger()).length;
+		// Compaction keeps steps 3..8 behind a summary: 6 assistants -> request 7 again.
+		const compacted = [
+			{ role: "compactionSummary", summary: "steps 1-2", tokensBefore: 1, timestamp: 1 } as unknown as AgentMessage,
+			...history(8).slice(resultIndex(2) + 1),
+		];
+		const projected = await h.send(compacted);
+		const placeholders = projected.filter((message) => message.role === "toolResult" && isPlaceholder(message)).length;
+		const newRows = (await h.ledger()).slice(before).filter((row) => row.event === "placeholder").length;
+		expect(placeholders).toBeGreaterThan(0);
+		expect(newRows).toBeLessThan(placeholders);
+	});
+
+	it("documents: a placeholder re-sent after a rewind is logged with sendNumber <= FULL_SENDS", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		await sendSteps(h, 1, 4);
+		h.clock.now = 20_000;
+		await h.pi.emitContext([...history(1), assistant(2_000, "retry from checkpoint")], h.context());
+		const rewoundRows = (await h.ledger()).filter((row) => row.event === "placeholder" && row.request === 3 && (row.sendNumber as number) <= 2);
+		expect(rewoundRows.length).toBe(1);
+	});
+});
+
+describe("round 1: scale and state growth", () => {
+	it("per-call latency over a long growing session stays bounded and close to legacy", async () => {
+		const run = async (batchThresholdTokens: number) => {
+			const h = await harness({ batchThresholdTokens });
+			const samples: number[] = [];
+			for (let steps = 1; steps <= 120; steps += 1) {
+				const messages = history(steps);
+				const started = performance.now();
+				await h.send(messages);
+				samples.push(performance.now() - started);
+			}
+			const tail = samples.slice(-40).sort((a, b) => a - b);
+			return { p50: tail[20] ?? 0, p95: tail[37] ?? 0, rows: (await h.ledger()).length };
+		};
+		const legacy = await run(0);
+		const batched = await run(20_000);
+		console.info(`[verify] 120-step session: legacy p50 ${legacy.p50.toFixed(1)} p95 ${legacy.p95.toFixed(1)} ms rows ${legacy.rows}; batched p50 ${batched.p50.toFixed(1)} p95 ${batched.p95.toFixed(1)} ms rows ${batched.rows}`);
+		expect(batched.p95).toBeLessThan(Math.max(250, legacy.p95 * 3));
+		// One ledger row (and one de-dup key) per (observation, request): quadratic in session length, capped at 100k keys per root.
+		expect(batched.rows).toBeLessThan(120 * 121);
+	}, 120_000);
 });

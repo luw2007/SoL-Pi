@@ -6,12 +6,17 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../src/sol-pi/config.ts";
 import { registerConfiguredFeatures } from "../src/sol-pi/index.ts";
-import { firstChangedIndex, requestTiming } from "../src/sol-pi/extensions/observation-pack/batching.ts";
+import {
+	firstChangedIndex,
+	lastCacheWarmAt,
+	requestTiming,
+	sideTurnStart,
+} from "../src/sol-pi/extensions/observation-pack/batching.ts";
 import {
 	createObservation,
 	createObservationPackExtension,
@@ -133,6 +138,30 @@ async function harness(options: ObservationPackOptions = {}, sessionDir?: string
 		ledger: () => readJsonl("ledger.jsonl"),
 		prefixLedger: () => readJsonl("prefix-ledger.jsonl"),
 	};
+}
+
+/** Session manager with omp-style leaf/parent lookups and cache-warm `model_usage` entries. */
+class WarmingSessionManager extends FakeSessionManager {
+	getLeafEntry(): SessionEntry | undefined {
+		return this.entries.find((entry) => entry.id === this.leafId);
+	}
+
+	getEntry(id: string): SessionEntry | undefined {
+		return this.entries.find((entry) => entry.id === id);
+	}
+
+	appendWarm(at: number, usage = { cacheRead: 50_000, cacheWrite: 0 }, purpose = "cache-warm"): void {
+		const id = `warm-${this.entries.length + 1}`;
+		this.entries.push({
+			type: "model_usage",
+			id,
+			parentId: this.leafId,
+			timestamp: new Date(at).toISOString(),
+			purpose,
+			usage,
+		} as unknown as SessionEntry);
+		this.leafId = id;
+	}
 }
 
 async function sendSteps(h: Harness, from: number, to: number): Promise<AgentMessage[]> {
@@ -274,6 +303,93 @@ describe("observation pack cache-aware batching", () => {
 		await sendSteps(h, 1, 2);
 		h.clock.now = 3_000 + 300_000;
 		expect(isPlaceholder((await h.send(history(3)))[resultIndex(1)])).toBe(true);
+	});
+
+	it("measures the cold gap from a later omp cache-warming refresh", async () => {
+		const h = await harness({ batchThresholdTokens: 100_000 });
+		const manager = new WarmingSessionManager([], SESSION_ID, h.sessionDir);
+		const ctx = { sessionManager: manager as never };
+		for (let steps = 1; steps <= 2; steps += 1) {
+			manager.appendMessage(assistant(steps * 1_000));
+			await h.send(history(steps), ctx);
+		}
+		manager.appendMessage(assistant(3_000));
+		// Idle for 20 minutes, kept warm by refreshes every 270 s; the last one 60 s ago.
+		for (let at = 3_000 + 270_000; at <= 3_000 + 1_140_000; at += 270_000) manager.appendWarm(at);
+		manager.appendMessage(user("next prompt"));
+		h.clock.now = 3_000 + 1_140_000 + 60_000;
+		const warm = await h.pi.emitContext(history(3), h.context(ctx));
+		expect(isPlaceholder(warm[resultIndex(1)])).toBe(false);
+
+		// Warming stopped: the gap since the last refresh reaches the default five minutes.
+		manager.appendMessage(assistant(4_000));
+		manager.appendWarm(h.clock.now + 1_000, { cacheRead: 50_000, cacheWrite: 0 }, "cache-warm:extension-override");
+		h.clock.now += 1_000 + 300_000;
+		const cold = await h.pi.emitContext(history(4), h.context(ctx));
+		expect([1, 2].map((step) => isPlaceholder(cold[resultIndex(step)]))).toEqual([true, true]);
+		expect((await h.ledger()).flatMap((row) => (row.flushReason ? [row.flushReason] : []))).toEqual([
+			"cold-gap",
+			"cold-gap",
+		]);
+	});
+
+	it("ignores cache-warming entries without cache tokens or before the last assistant", () => {
+		const manager = new WarmingSessionManager([], SESSION_ID);
+		const ctx = fakeContext(manager as never);
+		expect(lastCacheWarmAt(ctx)).toBeUndefined();
+		manager.appendWarm(10_000);
+		manager.appendMessage(assistant(20_000));
+		manager.appendWarm(30_000, { cacheRead: 0, cacheWrite: 0 });
+		manager.appendMessage(user("next"));
+		expect(lastCacheWarmAt(ctx)).toBeUndefined();
+		manager.appendWarm(40_000, { cacheRead: 0, cacheWrite: 9_000 });
+		manager.appendWarm(50_000);
+		expect(lastCacheWarmAt(ctx)).toBe(50_000);
+		expect(requestTiming([assistant(20_000)], undefined, 60_000, lastCacheWarmAt(ctx)).gapMs).toBe(10_000);
+
+		// Hosts without leaf lookups, or with throwing ones, give no warming signal.
+		expect(lastCacheWarmAt(fakeContext(new FakeSessionManager()))).toBeUndefined();
+		const broken = Object.assign(new WarmingSessionManager([], SESSION_ID), {
+			getLeafEntry: () => {
+				throw new Error("unavailable");
+			},
+		});
+		expect(lastCacheWarmAt(fakeContext(broken as never))).toBeUndefined();
+	});
+
+	it("recognises an omp side-turn suffix only with replayed answers", () => {
+		const developer = { role: "developer", content: [{ type: "text", text: "side rules" }], timestamp: 0 } as unknown as AgentMessage;
+		const main = history(2);
+		const replayed = assistant(9_000, "earlier side answer");
+		expect(sideTurnStart([...main, developer, user("q1"), replayed, user("q2")])).toBe(main.length);
+		// A first side question adds no assistant, so it needs no special handling.
+		expect(sideTurnStart([...main, developer, user("q1")])).toBeUndefined();
+		// A real reply (with usage) or a tool call after a developer reminder is the main stream.
+		const real = { ...(replayed as object), usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 } } as AgentMessage;
+		expect(sideTurnStart([...main, developer, user("q1"), real, user("q2")])).toBeUndefined();
+		const toolCall = { ...(replayed as object), content: [{ type: "toolCall", id: "c", name: "read", arguments: {} }] } as AgentMessage;
+		expect(sideTurnStart([...main, developer, user("q1"), toolCall, user("q2")])).toBeUndefined();
+		expect(sideTurnStart([...main, developer, user("q1"), replayed, result(9), user("q2")])).toBeUndefined();
+		expect(sideTurnStart([...main, developer, user("q1"), replayed])).toBeUndefined();
+		expect(sideTurnStart([user("q1"), replayed, user("q2")])).toBeUndefined();
+	});
+
+	it("a side turn neither counts its replayed answers as sends nor flushes nor replaces the previous request", async () => {
+		const h = await harness({ batchThresholdTokens: 1, prefixDiagnostics: true });
+		await sendSteps(h, 1, 3); // r1 swapped (threshold), r2 sent twice, r3 once
+		const developer = { role: "developer", content: [{ type: "text", text: "side rules" }], timestamp: 0 } as unknown as AgentMessage;
+		const side = [...history(3), developer, user("q1"), assistant(9_000, "a1"), user("q2"), assistant(9_000, "a2"), user("q3")];
+		h.clock.now = 10_000_000; // a cold gap would flush a main request
+		const sideOut = await h.pi.emitContext(side, h.context());
+		expect([1, 2, 3].map((step) => isPlaceholder(sideOut[resultIndex(step)]))).toEqual([true, false, false]);
+		const diagnostics = await h.prefixLedger();
+		expect(diagnostics.at(-1)).toMatchObject({ continuation: false, flush: false, request: 4, prevMessageCount: null });
+		// The next main request swaps r2 (third send) but not r3 (second send), with no prefix change.
+		h.clock.now = 0;
+		const main = await h.send(history(4));
+		expect([1, 2, 3].map((step) => isPlaceholder(main[resultIndex(step)]))).toEqual([true, true, false]);
+		expect(diagnostics.length + 1).toBe((await h.prefixLedger()).length);
+		expect((await h.prefixLedger()).at(-1)).toMatchObject({ continuation: true, firstChangedIndex: null, flushReason: "threshold" });
 	});
 
 	it("flushes pending observations when the model changes", async () => {

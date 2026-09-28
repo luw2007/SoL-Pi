@@ -912,3 +912,193 @@ describe("B6 duplicate rows when an interleaved call carries a large result unde
 		expect(keys.filter((key, index) => keys.indexOf(key) !== index)).toEqual([]);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Round 2 (fix 890ecc3): edge cases around the D1 / D2 / D3 / R5 fixes.
+describe("round 2: rewind keeps placeholders without side effects (D1 fix)", () => {
+	it("a rewind re-sends the placeholder without a second flushReason, toast or spurious prefix flush", async () => {
+		const h = await harness({ batchThresholdTokens: 1_000_000 });
+		for (let steps = 1; steps <= 2; steps += 1) await h.send(history(steps));
+		// Request 4 under another model: r1 (eligible) flushes with model-change.
+		const flushed = await h.send(history(3), { ctx: { model: { provider: "p2", id: "m2" } as never } });
+		expect(isPlaceholder(flushed[at(1)])).toBe(true);
+		await h.send(history(4)); // r2 now pending, warm, below threshold
+		const toastsBefore = h.notify.mock.calls.length;
+		// Rewind to a point with one assistant after r1, then continue on the branch.
+		const branch = [...history(2), user("retry differently")];
+		const rewound = await h.send(branch);
+		expect([isPlaceholder(rewound[at(1)]), isPlaceholder(rewound[at(2)])]).toEqual([true, false]);
+		const continued = await h.send([...branch, assistant(9_000), result(9)]);
+		expect([isPlaceholder(continued[at(1)]), isPlaceholder(continued[at(2)])]).toEqual([true, false]);
+		expect(h.notify.mock.calls.length).toBe(toastsBefore);
+		const rows = await h.ledger();
+		expect(flushRows(rows).map((row) => [row.id, row.flushReason])).toEqual([[flushRows(rows)[0]!.id, "model-change"]]);
+		const keys = rows.map(keyOf);
+		expect(keys.filter((key, index) => keys.indexOf(key) !== index)).toEqual([]);
+	});
+
+	it("a rewind to before the swapped observation and back re-applies the placeholder", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		for (let steps = 1; steps <= 3; steps += 1) await h.send(history(steps));
+		await h.send([user("start"), user("fresh start")]);
+		const back = await h.send(history(1));
+		expect(isPlaceholder(back[at(1)])).toBe(true);
+	});
+});
+
+describe("round 2: non-request context calls (D2 fix)", () => {
+	it("two consecutive steering calls followed by a repeat of the previous request do not flush", async () => {
+		const h = await harness({ batchThresholdTokens: 1_000_000 });
+		for (let steps = 1; steps <= 3; steps += 1) await h.send(history(steps));
+		await h.send([user("steer 1")]);
+		await h.send([user("steer 1"), user("steer 2")]);
+		const repeat = await h.send(history(3));
+		const next = await h.send([...history(4), user("steer 1"), user("steer 2")]);
+		for (const out of [repeat, next]) expect([1, 2].map((step) => isPlaceholder(out[at(step)]))).toEqual([false, false]);
+		expect(flushRows(await h.ledger())).toEqual([]);
+	});
+
+	it("a genuine prefix change across a steering call is still detected (prefix-changed from index 0)", async () => {
+		const h = await harness({ batchThresholdTokens: 1_000_000 });
+		for (let steps = 1; steps <= 3; steps += 1) await h.send(history(steps));
+		await h.send([user("steer")]);
+		const rewritten = [user("rewritten by another extension"), ...history(4).slice(1)];
+		const out = await h.send(rewritten);
+		expect([1, 2, 3].map((step) => isPlaceholder(out[at(step)]))).toEqual([true, true, false]);
+		expect(flushRows(await h.ledger()).map((row) => row.flushReason)).toEqual(["prefix-changed", "prefix-changed"]);
+	});
+
+	it("a cold gap after a steering call still flushes with cold-gap", async () => {
+		const h = await harness({ batchThresholdTokens: 1_000_000, coldGapMs: 60_000 });
+		for (let steps = 1; steps <= 3; steps += 1) await h.send(history(steps));
+		await h.send([user("steer")], { now: 10_000 });
+		const out = await h.send(history(4), { now: 4_000 + 60_000 });
+		expect([1, 2].map((step) => isPlaceholder(out[at(step)]))).toEqual([true, true]);
+		expect(flushRows(await h.ledger()).map((row) => row.flushReason)).toEqual(["cold-gap", "cold-gap"]);
+	});
+
+	it("a steering call as the very first call of a fresh process keeps process-start for the resumed request", async () => {
+		const dir = await tempDir();
+		const first = await harness({ batchThresholdTokens: 1_000_000 }, dir);
+		for (let steps = 1; steps <= 3; steps += 1) await first.send(history(steps));
+		const restarted = await harness({ batchThresholdTokens: 1_000_000 }, dir);
+		await restarted.send([user("steer")]);
+		const out = await restarted.send(history(4));
+		expect([1, 2, 3].map((step) => isPlaceholder(out[at(step)]))).toEqual([true, true, false]);
+		expect(flushRows(await restarted.ledger()).map((row) => row.flushReason)).toEqual(["process-start", "process-start"]);
+	});
+
+	it("a steering call re-sends existing placeholders and writes a continuation:false diagnostics row", async () => {
+		const h = await harness({ batchThresholdTokens: 1, prefixDiagnostics: true });
+		for (let steps = 1; steps <= 3; steps += 1) await h.send(history(steps));
+		// Defensive shape: a zero-assistant call that still carries an already swapped result.
+		const odd = await h.send([user("start"), result(1)]);
+		expect(isPlaceholder(odd[1])).toBe(true);
+		const rows = await h.prefix();
+		const last = rows.at(-1)!;
+		expect([last.continuation, last.prevMessageCount, last.firstChangedIndex, last.repeat, last.flush]).toEqual([
+			false,
+			null,
+			null,
+			false,
+			false,
+		]);
+	});
+
+	it("legacy (T=0) with diagnostics ignores steering calls for prefix tracking and projects like the original", async () => {
+		const calls: AgentMessage[][] = [history(1), history(2), [user("steer")], history(3), [user("steer")], history(4), history(4)];
+		const run = async (factory: (pi: FakePi) => void) => {
+			const dir = await tempDir("op-legacy-steer-");
+			const pi = new FakePi();
+			factory(pi);
+			const outs: string[] = [];
+			for (const messages of calls) {
+				const ctx = fakeContext(new FakeSessionManager([], "root-a", dir), {
+					mode: "tui",
+					hasUI: true,
+					ui: { notify: vi.fn(), setStatus: vi.fn() } as never,
+					model: { provider: PROVIDER, id: MODEL } as never,
+				});
+				outs.push(JSON.stringify(await pi.emitContext(messages, ctx)));
+			}
+			return { outs, prefix: await readJsonl(join(dir, "sol-pi", "root-a", "observation-pack", "prefix-ledger.jsonl")) };
+		};
+		const original = await run((pi) => createOriginalExtension()(pi.asExtensionApi()));
+		const legacy = await run((pi) =>
+			createObservationPackExtension({ batchThresholdTokens: 0, prefixDiagnostics: true })(pi.asExtensionApi()),
+		);
+		expect(legacy.outs).toEqual(original.outs);
+		expect(legacy.prefix.map((row) => row.continuation)).toEqual([true, true, false, true, false, true, true]);
+		// History(3) after the steering call is compared with history(2), not with the steering call.
+		expect(legacy.prefix[3]?.prevMessageCount).toBe(history(2).length);
+		expect(legacy.prefix.every((row) => row.firstChangedIndex === null || row.continuation === true)).toBe(true);
+	});
+});
+
+describe("round 2: process-wide ledger de-dup (D3 fix) does not suppress swaps", () => {
+	it("after compaction repeats a request number, the placeholder is still sent and not re-toasted", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		for (let steps = 1; steps <= 5; steps += 1) await h.send(history(steps));
+		const toasts = h.notify.mock.calls.length;
+		// Compaction drops leading turns: the assistant count (request number) falls back to 4.
+		const compacted = [user("summary"), ...history(5).slice(3)];
+		const out = await h.send(compacted);
+		const idx = compacted.findIndex((message) => message.role === "toolResult");
+		expect(isPlaceholder(out[idx])).toBe(true);
+		expect(h.notify.mock.calls.length).toBe(toasts);
+		const keys = (await h.ledger()).map(keyOf);
+		expect(keys.filter((key, index) => keys.indexOf(key) !== index)).toEqual([]);
+	});
+
+	it("legacy (T=0) writes no duplicate (event, id, request) rows across compaction", async () => {
+		const h = await harness({ batchThresholdTokens: 0 });
+		for (let steps = 1; steps <= 5; steps += 1) await h.send(history(steps));
+		const compacted = [user("summary"), ...history(5).slice(3)];
+		await h.send(compacted);
+		await h.send([...compacted, assistant(9_000), result(9)]);
+		const keys = (await h.ledger()).map(keyOf);
+		expect(keys.filter((key, index) => keys.indexOf(key) !== index)).toEqual([]);
+	});
+});
+
+describe("round 2: malformed tool results (R5 fix)", () => {
+	const shapes: Array<[string, unknown]> = [
+		["string content", "x".repeat(THRESHOLD_BYTES * 2)],
+		["undefined content", undefined],
+		["null block", [null]],
+		["block without type", [{ text: "x".repeat(THRESHOLD_BYTES * 2) }]],
+		["text block with non-string text", [{ type: "text", text: 42 }]],
+	];
+	for (const [name, content] of shapes) {
+		for (const batchThresholdTokens of [1, 20_000]) {
+			it(`batched T=${batchThresholdTokens}: ${name} neither throws nor alters the message`, async () => {
+				const h = await harness({ batchThresholdTokens });
+				const odd = { ...result(1), content } as unknown as AgentMessage;
+				const messages = [user("start"), assistant(1_000), odd, assistant(2_000), result(2), assistant(3_000), result(3)];
+				const out = await h.send(messages);
+				expect(JSON.stringify(out[2])).toBe(JSON.stringify(odd));
+			});
+		}
+	}
+
+	// DEFECT R2-1 (low, pre-existing in 0bff376): legacy T=0 evaluates isPureTextResult outside its try, so a
+	// null content block throws out of the context hook (B9). Batched mode is fixed. Flip to `it` once fixed.
+	it.fails("legacy T=0 with a null content block does not throw out of the hook (original throws too)", async () => {
+		const odd = { ...result(1), content: [null] } as unknown as AgentMessage;
+		const messages = [user("start"), assistant(1_000), odd];
+		const runOne = async (factory: (pi: FakePi) => void) => {
+			const pi = new FakePi();
+			factory(pi);
+			const dir = await tempDir();
+			const ctx = fakeContext(new FakeSessionManager([], "s", dir), { model: { provider: PROVIDER, id: MODEL } as never });
+			return pi.emitContext(messages, ctx).then(
+				() => "ok",
+				() => "throws",
+			);
+		};
+		const original = await runOne((pi) => createOriginalExtension()(pi.asExtensionApi()));
+		const legacy = await runOne((pi) => createObservationPackExtension({ batchThresholdTokens: 0 })(pi.asExtensionApi()));
+		// B9: never throw out of the hook. (T=0 must equal the original; if the original throws this documents the conflict.)
+		expect({ original, legacy }).toEqual({ original, legacy: "ok" });
+	});
+});

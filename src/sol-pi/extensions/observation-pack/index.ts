@@ -35,9 +35,11 @@ import {
 	DEFAULT_COLD_GAP_MS,
 	type FlushReason,
 	firstChangedIndex,
+	lastCacheWarmAt,
 	messageFingerprint,
 	type RequestTiming,
 	requestTiming,
+	sideTurnStart,
 } from "./batching.ts";
 import { createLedger, type Ledger } from "./ledger.ts";
 import {
@@ -71,7 +73,7 @@ const LOGGED_KEYS_MAX = 100_000;
 export interface ObservationPackOptions {
 	/** Σ removable pending tokens that triggers a batch swap; `0` keeps the legacy immediate swap. */
 	readonly batchThresholdTokens?: number;
-	/** Idle gap since the last assistant message after which pending observations swap. */
+	/** Idle gap since the last assistant message (or a later host cache-warming refresh) after which pending observations swap. */
 	readonly coldGapMs?: number;
 	/** Append one prefix/flush diagnostics row per `context` call. */
 	readonly prefixDiagnostics?: boolean;
@@ -164,9 +166,9 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 		};
 		/**
 		 * `continuation` is false for a call without any assistant message (e.g. omp live
-		 * steering converts only the newly typed messages). Such a call is not part of
-		 * the root's request stream, and it cannot hold an eligible observation: it is
-		 * neither compared with nor recorded as the previous request.
+		 * steering converts only the newly typed messages) and for an omp side turn
+		 * (`/btw`). Such a call is not part of the root's request stream: it flushes
+		 * nothing, and it is neither compared with nor recorded as the previous request.
 		 */
 		const inspectRequest = (
 			state: RootState,
@@ -181,7 +183,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 				fingerprints,
 				previous,
 				firstChanged: previous ? firstChangedIndex(previous.fingerprints, fingerprints) : undefined,
-				timing: requestTiming(sent, currentModel(ctx), now()),
+				timing: requestTiming(sent, currentModel(ctx), now(), lastCacheWarmAt(ctx)),
 			};
 		};
 		const writeDiagnostics = async (
@@ -201,7 +203,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 					gapMs: view.timing.gapMs ?? null,
 					modelChanged: view.timing.modelChanged,
 					repeat: view.previous?.request === request,
-				continuation: view.continuation,
+					continuation: view.continuation,
 					pendingCount: pending.count,
 					pendingTokens: pending.tokens,
 					flush: flushedCount > 0,
@@ -433,7 +435,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			try {
 				view = inspectRequest(state, beforeFlush, ctx, continuation);
 				const { gapMs, modelChanged } = view.timing;
-				// A non-continuation call has no assistant, hence no eligible observation: nothing to flush.
+				// A non-continuation call (steering, side turn) only re-sends existing placeholders.
 				const flushAll: FlushReason | undefined = !continuation
 					? undefined
 					: !view.previous
@@ -552,6 +554,16 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 				return undefined;
 			}
 			const state = stateFor(root);
+			const legacy = batchThresholdTokens === 0;
+			// A side turn (omp `/btw`) is not part of the main request stream: its replayed
+			// answers do not count as sends, and it neither flushes nor becomes the previous request.
+			let side: number | undefined;
+			try {
+				side = legacy ? undefined : sideTurnStart(event.messages);
+			} catch (error) {
+				failOpen(error, "side turn");
+			}
+			const mainEnd = side ?? event.messages.length;
 			// How many provider requests each message has already been part of,
 			// counted by the assistant messages that follow it.
 			const priorAssistantCounts = new Array<number>(event.messages.length);
@@ -559,12 +571,12 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 
 			for (let index = event.messages.length - 1; index >= 0; index -= 1) {
 				priorAssistantCounts[index] = assistantCount;
-				if (event.messages[index]?.role === "assistant") assistantCount += 1;
+				if (index < mainEnd && event.messages[index]?.role === "assistant") assistantCount += 1;
 			}
 
 			const requestIndex = assistantCount + 1;
-			const continuation = assistantCount > 0;
-			const project = batchThresholdTokens === 0 ? projectLegacy : projectBatched;
+			const continuation = assistantCount > 0 && side === undefined;
+			const project = legacy ? projectLegacy : projectBatched;
 			return {
 				messages: await project(event.messages, ctx, root, state, priorAssistantCounts, requestIndex, continuation),
 			};

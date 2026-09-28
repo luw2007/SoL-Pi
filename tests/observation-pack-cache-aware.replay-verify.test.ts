@@ -81,4 +81,54 @@ describe("observation pack batching: verifier edge cases", () => {
 		expect(isPlaceholder(second[2])).toBe(true);
 	});
 
+	// Round 2 (replay of real omp sessions against 890ecc3): shapes that showed up in the replay.
+	const stripTimestamps = (rows: Record<string, unknown>[]) => rows.map(({ timestamp: _t, ...row }) => JSON.stringify(row));
+	const toolTurn = (step: number, timestamp: number, model = "m") =>
+		[{ ...(assistant(timestamp) as object), model } as AgentMessage, result(step)] as AgentMessage[];
+
+	it("omp live steering: zero-assistant context calls before every request leave outputs and ledger unchanged", async () => {
+		const plain = await harness({ batchThresholdTokens: 30_000, prefixDiagnostics: true });
+		const steered = await harness({ batchThresholdTokens: 30_000, prefixDiagnostics: true });
+		// Timeline with a threshold flush, a cold gap and a model change.
+		const times = [1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 400_000, 401_000, 402_000, 403_000, 404_000, 405_000];
+		let history: AgentMessage[] = [user("start")];
+		for (let step = 0; step < times.length; step += 1) {
+			const model = step >= 9 ? "m2" : "m";
+			history = [...history, ...toolTurn(step + 1, times[step] as number, model)];
+			const steer = [user(`steer ${step}`)];
+			const unchanged = await steered.send(steer);
+			expect(JSON.stringify(unchanged)).toBe(JSON.stringify(steer));
+			const a = await plain.send(history);
+			const b = await steered.send(history);
+			expect(JSON.stringify(b)).toBe(JSON.stringify(a));
+		}
+		const rowsA = await plain.ledger();
+		expect(rowsA.some((row) => row.event === "placeholder")).toBe(true);
+		expect(stripTimestamps(await steered.ledger())).toEqual(stripTimestamps(rowsA));
+	});
+
+	it("compaction repeats request numbers: no duplicate (event, id, request) rows and swapped results stay placeholders", async () => {
+		const h = await harness({ batchThresholdTokens: 1 });
+		let history: AgentMessage[] = [user("start")];
+		for (let step = 1; step <= 6; step += 1) {
+			history = [...history, ...toolTurn(step, step * 1_000)];
+			await h.send(history);
+		}
+		// Compaction: summary + the last kept turns, so assistant counts (request numbers) drop and then rise again.
+		const summary = { role: "compactionSummary", summary: "earlier work", tokensBefore: 1, timestamp: 6_500 } as unknown as AgentMessage;
+		let compacted: AgentMessage[] = [summary, ...history.slice(-6)];
+		const firstKept = compacted.findIndex((message) => message.role === "toolResult");
+		const before = await h.send(compacted);
+		expect(isPlaceholder(before[firstKept])).toBe(true);
+		for (let step = 7; step <= 10; step += 1) {
+			compacted = [...compacted, ...toolTurn(step, step * 1_000)];
+			const out = await h.send(compacted);
+			expect(isPlaceholder(out[firstKept])).toBe(true);
+		}
+		const rows = await h.ledger();
+		const keys = rows.map((row) => `${row.event}:${row.id}:${row.request}`);
+		expect(new Set(keys).size).toBe(keys.length);
+		const flushRows = rows.filter((row) => row.flushReason !== undefined).map((row) => row.id);
+		expect(new Set(flushRows).size).toBe(flushRows.length);
+	});
 });
