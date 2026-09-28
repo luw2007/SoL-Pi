@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createObservationPackExtension,
 	FULL_SENDS,
+	type ObservationPackOptions,
 	THRESHOLD_BYTES,
 } from "../src/sol-pi/extensions/observation-pack/index.ts";
 import { componentText, FakePi, FakeSessionManager, fakeContext, plainTheme } from "./helpers.ts";
@@ -31,9 +32,10 @@ async function sessionRoot(): Promise<string> {
 	return value;
 }
 
-function observationPackPi(): FakePi {
+/** Legacy immediate swap (threshold 0): each context call counts as one provider request. */
+function observationPackPi(options: ObservationPackOptions = { batchThresholdTokens: 0 }): FakePi {
 	const pi = new FakePi();
-	createObservationPackExtension()(pi.asExtensionApi());
+	createObservationPackExtension(options)(pi.asExtensionApi());
 	return pi;
 }
 
