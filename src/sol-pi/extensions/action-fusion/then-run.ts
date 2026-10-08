@@ -112,12 +112,19 @@ export async function executeMutationThenRun<TDetails>({
 		try {
 			const bashResult = await bash.execute(`${toolCallId}:then_run`, thenRun, signal, undefined, ctx);
 			const output = resultText(bashResult);
+			// Keep the mutation's own details (edit diff/firstChangedLine) and add the
+			// bash details (fullOutputPath/truncation) the reducer reads to reach the
+			// untruncated log instead of scraping the inline text.
+			const details = bashResult.details
+				? ({ ...(mutationResult.details as object | undefined), ...bashResult.details } as TDetails)
+				: mutationResult.details;
 			return {
 				...mutationResult,
 				content: [
 					...mutationResult.content,
 					{ type: "text", text: output ? `${THEN_RUN_SUCCEEDED}\n${output}` : THEN_RUN_SUCCEEDED },
 				],
+				details,
 			};
 		} catch (error) {
 			const mutationOutput = resultText(mutationResult);

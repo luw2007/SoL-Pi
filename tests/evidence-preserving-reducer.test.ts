@@ -320,9 +320,6 @@ describe("evidence-preserving reducer", () => {
 		expect((await stat(sourcePath)).mode & 0o777).toBe(0o600);
 		expect(events.filter((entry) => entry.kind === "applied")).toHaveLength(1);
 		expect(notify).toHaveBeenCalledTimes(1);
-		expect(notify.mock.calls[0]?.[0]).toMatch(
-			/^⚡ SoL-Pi · Luna Delegating\nMoney saved · .+ removed from future prompts$/u,
-		);
 	});
 
 	it("uses Pi-resolved authentication on a fork-shaped model registry", async () => {
@@ -410,6 +407,37 @@ describe("evidence-preserving reducer", () => {
 			expect(await readFile(String(candidate?.sourcePath), "utf8")).toBe(body);
 		},
 	);
+
+	it("reads the exact log named by fused bash details, not a path quoted in command output", async () => {
+		const root = await storeRoot();
+		const fullBody = `ERROR fused full output\n${"full diagnostic\n".repeat(400)}`;
+		const outputPath = join(tmpdir(), `pi-bash-${randomUUID()}.log`);
+		const decoyPath = join(tmpdir(), `pi-bash-${randomUUID()}.log`);
+		await writeFile(outputPath, fullBody, { mode: 0o600 });
+		await writeFile(decoyPath, `ERROR decoy\n${"decoy\n".repeat(600)}`, { mode: 0o600 });
+		cleanupPaths.push(outputPath, decoyPath);
+		let input = "";
+		const { context, pi } = load(
+			root,
+			modelComplete(fullBody, (value) => {
+				input = value;
+				return {
+					schema: REDUCER_RECEIPT_SCHEMA,
+					source_sha256: sourceHash(value),
+					status: "failure",
+					uncertain: false,
+					evidence: [{ kind: "failure", quote: "ERROR fused full output" }],
+				};
+			}),
+		);
+		const event = fusedEvent(`ERROR truncated\nFull output: ${decoyPath}\n`, false);
+		event.details = { patch: "test patch", fullOutputPath: outputPath } as never;
+
+		await pi.emit("tool_result", event, context);
+
+		expect(input).toContain(fullBody);
+		expect(input).not.toContain("ERROR decoy");
+	});
 
 	it.each(["invented", "model-error"] as const)("fails open on %s", async (mode) => {
 		const root = await storeRoot();

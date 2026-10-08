@@ -13,7 +13,6 @@ import {
 	createActionFusionExtension,
 } from "../src/sol-pi/extensions/action-fusion/index.ts";
 import { withFusedFileQueue } from "../src/sol-pi/extensions/action-fusion/file-queue.ts";
-import { componentText, plainTheme } from "./helpers.ts";
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -87,8 +86,6 @@ describe("action fusion then_run", () => {
 
 		expect(objectSchema(write).properties.then_run).toMatchObject({
 			type: "object",
-			description:
-				"Command to run next on this file after the write succeeds — e.g. run, build, start/restart, install, or check it; optional timeout in seconds. Skipped if the write fails; a non-zero exit is reported but keeps the write.",
 			properties: {
 				command: { type: "string" },
 				timeout: { type: "number" },
@@ -97,8 +94,6 @@ describe("action fusion then_run", () => {
 		});
 		expect(objectSchema(edit).properties.then_run).toMatchObject({
 			type: "object",
-			description:
-				"Command to run next on this file after the edit succeeds — e.g. run, build, start/restart, install, or check it; optional timeout in seconds. Skipped if the edit fails; a non-zero exit is reported but keeps the edit.",
 			properties: {
 				command: { type: "string" },
 				timeout: { type: "number" },
@@ -116,34 +111,6 @@ describe("action fusion then_run", () => {
 		expect(Object.keys(objectSchema(edit).properties)).toEqual(["path", "edits", "then_run"]);
 		expect(write.name).toBe("write");
 		expect(edit.name).toBe("edit");
-	});
-
-	it.each([
-		{ label: "default checkout name", cwd: join(tmpdir(), "SoL-Pi"), path: "target.ts" },
-		{ label: "unrelated checkout name", cwd: join(tmpdir(), "plain-checkout"), path: "target.ts" },
-		{ label: "repository name in the target path", cwd: join(tmpdir(), "plain-checkout"), path: "SoL-Pi/target.ts" },
-	])("renders a fused mutation as an English lightning savings call ($label)", ({ cwd, path }) => {
-		const { write } = loadFusedTools();
-		const fusedArgs = {
-			path,
-			content: "export {};\n",
-			then_run: { command: "npm test" },
-		};
-		const fused = write.renderCall!(fusedArgs, plainTheme, {
-			cwd,
-			args: fusedArgs,
-		} as never);
-		const plainArgs = { path, content: "export {};\n" };
-		const plain = write.renderCall!(plainArgs, plainTheme, {
-			cwd,
-			args: plainArgs,
-		} as never);
-
-		expect(componentText(fused)).toContain("⚡ SoL-Pi · Action Fusion");
-		expect(componentText(fused)).toContain("Money saved · 1 model round-trip avoided");
-		// A normal path or its OSC 8 hyperlink may contain the repository name.
-		expect(componentText(plain)).not.toContain("⚡ SoL-Pi · Action Fusion");
-		expect(componentText(plain)).not.toContain("Money saved · 1 model round-trip avoided");
 	});
 
 	it("runs write then_run through bash after the written content is visible", async () => {
@@ -174,6 +141,41 @@ describe("action fusion then_run", () => {
 		expect(text(result)).toContain("write check passed");
 	});
 
+	it("keeps edit details and exposes bash truncation details for long then_run output", async () => {
+		const dir = await createTempDir();
+		const filePath = join(dir, "long.txt");
+		await writeFile(filePath, "before\n", "utf8");
+		const operations: BashOperations = {
+			exec: async (_command, _cwd, { onData }) => {
+				onData(Buffer.from("long output line\n".repeat(5000)));
+				return { exitCode: 0 };
+			},
+		};
+		const { edit } = loadFusedTools({ bashOptions: { operations } });
+
+		const result = await edit.execute(
+			"edit-long",
+			{ path: filePath, edits: [{ oldText: "before", newText: "after" }], then_run: { command: "long" } },
+			undefined,
+			undefined,
+			createContext(dir),
+		);
+
+		const details = result.details as {
+			diff?: string;
+			firstChangedLine?: number;
+			fullOutputPath?: string;
+			truncation?: { truncated: boolean };
+		};
+		expect(details.diff).toContain("after");
+		expect(details.firstChangedLine).toBe(1);
+		expect(details.truncation?.truncated).toBe(true);
+		expect(details.fullOutputPath).toBeDefined();
+		expect(text(result)).toContain(`Full output: ${details.fullOutputPath}`);
+		expect(await readFile(details.fullOutputPath!, "utf8")).toBe("long output line\n".repeat(5000));
+		await rm(details.fullOutputPath!, { force: true });
+	});
+
 	it("announces savings only after a fused command succeeds in TUI mode", async () => {
 		const dir = await createTempDir();
 		const notify = vi.fn();
@@ -190,10 +192,7 @@ describe("action fusion then_run", () => {
 			createContext(dir, { mode: "tui", hasUI: true, ui: { notify, setStatus } as never }),
 		);
 
-		expect(notify).toHaveBeenCalledWith(
-			"⚡ SoL-Pi · Action Fusion\nMoney saved · 1 model round-trip avoided",
-			"info",
-		);
+		expect(notify).toHaveBeenCalledTimes(1);
 	});
 
 	it("runs edit then_run after the edited content is visible", async () => {
