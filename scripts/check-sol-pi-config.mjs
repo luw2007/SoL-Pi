@@ -14,10 +14,21 @@ const FEATURE_KEYS = [
 ];
 const DEFAULT_CACHE_WRITE_READ_RATIO = 12.5;
 const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
+const DEFAULT_OBSERVATION_PACK_BATCH_THRESHOLD_TOKENS = 20_000;
+const DEFAULT_OBSERVATION_PACK_COLD_GAP_MS = 300_000;
 const DEFAULT_EPR_REDUCER_PROVIDER = ["openai", "codex"].join("-");
 const DEFAULT_EPR_REDUCER_MODEL = ["gpt-5.6", "luna"].join("-");
 const STRING_KEYS = ["evidencePreservingReducerModel", "evidencePreservingReducerProvider"];
-const CONFIG_KEYS = new Set(["version", ...FEATURE_KEYS, ...STRING_KEYS, "cacheWriteReadRatio", "keepRecentTokens"]);
+const CONFIG_KEYS = new Set([
+	"version",
+	...FEATURE_KEYS,
+	...STRING_KEYS,
+	"cacheWriteReadRatio",
+	"keepRecentTokens",
+	"observationPackBatchThresholdTokens",
+	"observationPackColdGapMs",
+	"observationPackPrefixDiagnostics",
+]);
 
 function fail(message) {
 	throw new Error(message);
@@ -93,6 +104,25 @@ function validateConfig(value, requireAllEnabled) {
 		fail("keepRecentTokens must be a positive safe integer");
 	}
 	effective.keepRecentTokens = keepRecentTokens;
+	const observationPackBatchThresholdTokens = Object.hasOwn(value, "observationPackBatchThresholdTokens")
+		? value.observationPackBatchThresholdTokens
+		: DEFAULT_OBSERVATION_PACK_BATCH_THRESHOLD_TOKENS;
+	if (!Number.isSafeInteger(observationPackBatchThresholdTokens) || observationPackBatchThresholdTokens < 0) {
+		fail("observationPackBatchThresholdTokens must be a non-negative safe integer");
+	}
+	effective.observationPackBatchThresholdTokens = observationPackBatchThresholdTokens;
+	const observationPackColdGapMs = Object.hasOwn(value, "observationPackColdGapMs")
+		? value.observationPackColdGapMs
+		: DEFAULT_OBSERVATION_PACK_COLD_GAP_MS;
+	if (!Number.isSafeInteger(observationPackColdGapMs) || observationPackColdGapMs < 1) {
+		fail("observationPackColdGapMs must be a positive safe integer");
+	}
+	effective.observationPackColdGapMs = observationPackColdGapMs;
+	const observationPackPrefixDiagnostics = Object.hasOwn(value, "observationPackPrefixDiagnostics")
+		? value.observationPackPrefixDiagnostics
+		: false;
+	if (typeof observationPackPrefixDiagnostics !== "boolean") fail("observationPackPrefixDiagnostics must be boolean");
+	effective.observationPackPrefixDiagnostics = observationPackPrefixDiagnostics;
 	effective.evidencePreservingReducerModel = stringConfigValue(
 		value,
 		"evidencePreservingReducerModel",

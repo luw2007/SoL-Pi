@@ -172,6 +172,39 @@ describe("SoL-Pi config", () => {
 		);
 	});
 
+	it("defaults and loads the ObservationPack batching keys", () => {
+		expect(DEFAULT_CONFIG).toMatchObject({
+			observationPackBatchThresholdTokens: 20_000,
+			observationPackColdGapMs: 300_000,
+			observationPackPrefixDiagnostics: false,
+		});
+		const { agentDir, cwd } = fixture();
+		const path = join(agentDir, "sol-pi.json");
+		const configured = {
+			observationPackBatchThresholdTokens: 0,
+			observationPackColdGapMs: 60_000,
+			observationPackPrefixDiagnostics: true,
+		};
+		writeFileSync(path, JSON.stringify({ version: 1, ...configured }));
+		expect(loadSolPiConfig(cwd, agentDir, true)).toEqual({ ...DEFAULT_CONFIG, ...configured });
+	});
+
+	it.each([
+		["observationPackBatchThresholdTokens", -1, "must be a non-negative integer"],
+		["observationPackBatchThresholdTokens", 1.5, "must be a non-negative integer"],
+		["observationPackBatchThresholdTokens", "20000", "must be a non-negative integer"],
+		["observationPackBatchThresholdTokens", null, "must be a non-negative integer"],
+		["observationPackColdGapMs", 0, "must be a positive integer"],
+		["observationPackColdGapMs", 1.5, "must be a positive integer"],
+		["observationPackColdGapMs", null, "must be a positive integer"],
+		["observationPackPrefixDiagnostics", "true", "must be boolean"],
+		["observationPackPrefixDiagnostics", null, "must be boolean"],
+	] as const)("rejects an invalid ObservationPack batching value: %s=%j", (key, value, message) => {
+		const { agentDir, cwd } = fixture();
+		writeFileSync(join(agentDir, "sol-pi.json"), JSON.stringify({ version: 1, [key]: value }));
+		expect(() => loadSolPiConfig(cwd, agentDir, true)).toThrow(`SoL-Pi config ${key} ${message}`);
+	});
+
 	it("wraps malformed JSON errors with the config path", () => {
 		const { agentDir, cwd } = fixture();
 		mkdirSync(join(cwd, CONFIG_DIR_NAME));
