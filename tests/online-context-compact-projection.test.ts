@@ -22,7 +22,8 @@ function history(): AgentMessage[] {
 	return [
 		{ role: "user", content: "Inspect the diagnostic output.", timestamp: 1 },
 		fauxAssistantMessage(fauxToolCall("bash", { command: "make test" }, { id: "large" })),
-		{ role: "toolResult", toolCallId: "large", toolName: "bash", content: [{ type: "text", text: "diagnostic line\n".repeat(13_000) }], isError: false, timestamp: 2 },
+		// Distinct lines avoid observation-pack's lossless repeated-line compression.
+		{ role: "toolResult", toolCallId: "large", toolName: "bash", content: [{ type: "text", text: Array.from({ length: 13_000 }, (_, index) => `diagnostic ${index}: inspected output item ${index}\n`).join("") }], isError: false, timestamp: 2 },
 		{ role: "user", content: "Continue with the next step.", timestamp: 3 },
 		fauxAssistantMessage("r".repeat(80_000)),
 	];
@@ -33,7 +34,10 @@ describe("ObservationPack and OCC savings", () => {
 		const root = await mkdtemp(join(tmpdir(), "sol-pi-occ-projection-"));
 		roots.push(root);
 		const manager = new FakeSessionManager([], "projection", root);
+		// ObservationPack counts a tool result's sends by the assistant messages that follow it;
+		// it only swaps after FULL_SENDS (2) of them, so a second assistant must follow the result.
 		const messages = history();
+		messages.splice(3, 0, fauxAssistantMessage("Noted the diagnostic output."));
 		for (const message of messages) manager.appendMessage(message);
 		const pi = new FakePi(manager);
 		createObservationPackExtension()(pi.asExtensionApi());
