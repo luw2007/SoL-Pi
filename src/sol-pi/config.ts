@@ -10,6 +10,10 @@ import {
 	DEFAULT_REDUCER_MODEL,
 	DEFAULT_REDUCER_PROVIDER,
 } from "./extensions/evidence-preserving-reducer/config.ts";
+import {
+	DEFAULT_BATCH_THRESHOLD_TOKENS,
+	DEFAULT_COLD_GAP_MS,
+} from "./extensions/observation-pack/batching.ts";
 
 export const DEFAULT_CACHE_WRITE_READ_RATIO = 12.5;
 
@@ -24,6 +28,12 @@ export interface SolPiConfig {
 	readonly cacheWriteReadRatio: number;
 	/** Host keep-recent budget for boundary compaction feasibility; undefined = extension default. */
 	readonly keepRecentTokens?: number;
+	/** ObservationPack batch swap threshold in removable tokens; 0 = legacy immediate swap. */
+	readonly observationPackBatchThresholdTokens: number;
+	/** ObservationPack idle gap after which pending observations swap. */
+	readonly observationPackColdGapMs: number;
+	/** Append ObservationPack prefix/flush diagnostics per provider request. */
+	readonly observationPackPrefixDiagnostics: boolean;
 }
 
 export const DEFAULT_CONFIG: SolPiConfig = Object.freeze({
@@ -35,6 +45,9 @@ export const DEFAULT_CONFIG: SolPiConfig = Object.freeze({
 	evidencePreservingReducerProvider: DEFAULT_REDUCER_PROVIDER,
 	onlineContextCompact: false,
 	cacheWriteReadRatio: DEFAULT_CACHE_WRITE_READ_RATIO,
+	observationPackBatchThresholdTokens: DEFAULT_BATCH_THRESHOLD_TOKENS,
+	observationPackColdGapMs: DEFAULT_COLD_GAP_MS,
+	observationPackPrefixDiagnostics: false,
 });
 
 const FEATURE_KEYS = [
@@ -50,6 +63,9 @@ const CONFIG_KEYS = new Set<string>([
 	...STRING_KEYS,
 	"cacheWriteReadRatio",
 	"keepRecentTokens",
+	"observationPackBatchThresholdTokens",
+	"observationPackColdGapMs",
+	"observationPackPrefixDiagnostics",
 ]);
 
 export function findConfigPath(
@@ -113,6 +129,30 @@ export function loadSolPiConfig(
 		(typeof keepRecentTokens !== "number" || !Number.isSafeInteger(keepRecentTokens) || keepRecentTokens <= 0)
 	) {
 		throw new Error(`SoL-Pi config keepRecentTokens must be a positive integer: ${path}`);
+	}
+	const observationPackBatchThresholdTokens = record.observationPackBatchThresholdTokens;
+	if (
+		observationPackBatchThresholdTokens !== undefined &&
+		(typeof observationPackBatchThresholdTokens !== "number" ||
+			!Number.isSafeInteger(observationPackBatchThresholdTokens) ||
+			observationPackBatchThresholdTokens < 0)
+	) {
+		throw new Error(`SoL-Pi config observationPackBatchThresholdTokens must be a non-negative integer: ${path}`);
+	}
+	const observationPackColdGapMs = record.observationPackColdGapMs;
+	if (
+		observationPackColdGapMs !== undefined &&
+		(typeof observationPackColdGapMs !== "number" ||
+			!Number.isSafeInteger(observationPackColdGapMs) ||
+			observationPackColdGapMs <= 0)
+	) {
+		throw new Error(`SoL-Pi config observationPackColdGapMs must be a positive integer: ${path}`);
+	}
+	if (
+		record.observationPackPrefixDiagnostics !== undefined &&
+		typeof record.observationPackPrefixDiagnostics !== "boolean"
+	) {
+		throw new Error(`SoL-Pi config observationPackPrefixDiagnostics must be boolean: ${path}`);
 	}
 	const evidencePreservingReducerModel = stringConfigValue(
 		record,

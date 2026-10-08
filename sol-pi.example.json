@@ -7,5 +7,8 @@
 	"evidencePreservingReducerModel": "model-id",
 	"onlineContextCompact": false,
 	"cacheWriteReadRatio": 12.5,
-	"keepRecentTokens": 20000
+	"keepRecentTokens": 20000,
+	"observationPackBatchThresholdTokens": 20000,
+	"observationPackColdGapMs": 300000,
+	"observationPackPrefixDiagnostics": false
 }
