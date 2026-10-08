@@ -10,6 +10,11 @@
  * original bytes are archived by observation id outside the provider context,
  * and the agent pulls exact pages back with the registered `obs_recall` tool.
  *
+ * Each swap edits the middle of the prompt and breaks the provider prompt
+ * cache from there, so eligible results wait as full text until a batch swap
+ * pays off or the cache is already cold (see `batching.ts`). A batch threshold
+ * of `0` keeps the original one-by-one swap.
+ *
  * The mechanism never edits history in place. It rewrites only at the
  * projection layer (`pi.on("context")`), so the stored session stays intact and
  * recall keeps working after native compaction or a session resume.
@@ -18,11 +23,24 @@
  */
 
 import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runtimeRoot } from "../../runtime-paths.ts";
 import { formatSavingsCount, renderSolPiTool, showSolPiSavings } from "../../tui.ts";
+import {
+	currentModel,
+	DEFAULT_BATCH_THRESHOLD_TOKENS,
+	DEFAULT_COLD_GAP_MS,
+	type FlushReason,
+	firstChangedIndex,
+	lastCacheWarmAt,
+	messageFingerprint,
+	type RequestTiming,
+	requestTiming,
+	sideTurnStart,
+} from "./batching.ts";
 import { createLedger, type Ledger } from "./ledger.ts";
 import {
 	countLines,
@@ -32,6 +50,7 @@ import {
 	FULL_SENDS,
 	isObservationId,
 	isPureTextResult,
+	type Observation,
 	observationPath,
 	placeholderFor,
 	type RecallChunk,
@@ -48,18 +67,152 @@ const RECALL_LIMITS = {
 	maxLines: RECALL_MAX_LINES - RECALL_HEADER_LINES,
 };
 
-export function createObservationPackExtension(): ExtensionFactory {
+/** Ledger de-dup keys kept per root; the oldest are dropped past this bound (a dropped key may be logged again). */
+const LOGGED_KEYS_MAX = 100_000;
+
+export interface ObservationPackOptions {
+	/** Σ removable pending tokens that triggers a batch swap; `0` keeps the legacy immediate swap. */
+	readonly batchThresholdTokens?: number;
+	/** Idle gap since the last assistant message (or a later host cache-warming refresh) after which pending observations swap. */
+	readonly coldGapMs?: number;
+	/** Append one prefix/flush diagnostics row per `context` call. */
+	readonly prefixDiagnostics?: boolean;
+	/** Clock for the cold-gap rule (epoch milliseconds). */
+	readonly now?: () => number;
+}
+
+/** Per session root state, kept for the life of this process. */
+interface RootState {
+	/** Observations already sent as placeholders; they never flip back to full text. */
+	readonly placeholders: Set<string>;
+	/** (event, id, request) ledger keys already written, so repeated `context` calls add no duplicates. */
+	readonly logged: Set<string>;
+	/** What the previous request of this root sent, for prefix-change detection. */
+	previous?: { readonly request: number; readonly fingerprints: readonly string[] };
+}
+
+/** One large pure-text tool result seen in the current request. */
+interface Candidate {
+	readonly index: number;
+	readonly observation: Observation;
+	readonly sendNumber: number;
+	readonly kind: "full" | "placeholder" | "pending";
+	readonly swap?: {
+		readonly message: AgentMessage;
+		readonly bytes: number;
+		readonly tokens: number;
+		readonly removedTokens: number;
+	};
+}
+
+/** Signals computed from the projection this root sends before any new swap. */
+interface RequestView {
+	readonly continuation: boolean;
+	readonly fingerprints: string[];
+	readonly previous: RootState["previous"];
+	readonly firstChanged: number | undefined;
+	readonly timing: RequestTiming;
+}
+
+function failOpen(error: unknown, scope: string): void {
+	const reason = error instanceof Error ? error.message : String(error);
+	console.error(`[observationpack] fail-open for ${scope}: ${reason}`);
+}
+
+export function createObservationPackExtension(options: ObservationPackOptions = {}): ExtensionFactory {
+	const batchThresholdTokens = options.batchThresholdTokens ?? DEFAULT_BATCH_THRESHOLD_TOKENS;
+	const coldGapMs = options.coldGapMs ?? DEFAULT_COLD_GAP_MS;
+	const prefixDiagnostics = options.prefixDiagnostics ?? false;
+	const now = options.now ?? Date.now;
+
 	return (pi: ExtensionAPI) => {
 		const sentCounts = new Map<string, number>();
+		const states = new Map<string, RootState>();
 		const ledgers = new Map<string, Ledger>();
-		const ledgerFor = (ctx: ExtensionContext): Ledger => {
-			const root = runtimeRoot(ctx);
-			let ledger = ledgers.get(root);
+		const ledgerAt = (root: string, name: string): Ledger => {
+			const path = join(root, "observation-pack", name);
+			let ledger = ledgers.get(path);
 			if (!ledger) {
-				ledger = createLedger(join(root, "observation-pack", "ledger.jsonl"));
-				ledgers.set(root, ledger);
+				ledger = createLedger(path);
+				ledgers.set(path, ledger);
 			}
 			return ledger;
+		};
+		const ledgerFor = (ctx: ExtensionContext): Ledger => ledgerAt(runtimeRoot(ctx), "ledger.jsonl");
+		const stateFor = (root: string): RootState => {
+			let state = states.get(root);
+			if (!state) {
+				state = { placeholders: new Set(), logged: new Set() };
+				states.set(root, state);
+			}
+			return state;
+		};
+		const recordOnce = async (
+			root: string,
+			state: RootState,
+			entry: { readonly event: string; readonly id: string; readonly request: number } & Record<string, unknown>,
+		): Promise<void> => {
+			const key = `${entry.event}\0${entry.id}\0${entry.request}`;
+			if (state.logged.has(key)) return;
+			// Reserve the key before the write so a concurrent call for the same request cannot log it twice.
+			state.logged.add(key);
+			if (state.logged.size > LOGGED_KEYS_MAX) state.logged.delete(state.logged.values().next().value as string);
+			try {
+				await ledgerAt(root, "ledger.jsonl")(entry);
+			} catch (error) {
+				state.logged.delete(key);
+				throw error;
+			}
+		};
+		/**
+		 * `continuation` is false for a call without any assistant message (e.g. omp live
+		 * steering converts only the newly typed messages) and for an omp side turn
+		 * (`/btw`). Such a call is not part of the root's request stream: it flushes
+		 * nothing, and it is neither compared with nor recorded as the previous request.
+		 */
+		const inspectRequest = (
+			state: RootState,
+			sent: readonly AgentMessage[],
+			ctx: ExtensionContext,
+			continuation: boolean,
+		): RequestView => {
+			const fingerprints = sent.map(messageFingerprint);
+			const previous = continuation ? state.previous : undefined;
+			return {
+				continuation,
+				fingerprints,
+				previous,
+				firstChanged: previous ? firstChangedIndex(previous.fingerprints, fingerprints) : undefined,
+				timing: requestTiming(sent, currentModel(ctx), now(), lastCacheWarmAt(ctx)),
+			};
+		};
+		const writeDiagnostics = async (
+			root: string,
+			request: number,
+			view: RequestView,
+			pending: { readonly count: number; readonly tokens: number },
+			flushReason: FlushReason | undefined,
+			flushedCount: number,
+		): Promise<void> => {
+			try {
+				await ledgerAt(root, "prefix-ledger.jsonl")({
+					request,
+					messageCount: view.fingerprints.length,
+					prevMessageCount: view.previous?.fingerprints.length ?? null,
+					firstChangedIndex: view.firstChanged ?? null,
+					gapMs: view.timing.gapMs ?? null,
+					modelChanged: view.timing.modelChanged,
+					repeat: view.previous?.request === request,
+					continuation: view.continuation,
+					pendingCount: pending.count,
+					pendingTokens: pending.tokens,
+					flush: flushedCount > 0,
+					flushReason: flushedCount > 0 ? (flushReason ?? null) : null,
+					flushedCount,
+				});
+			} catch (error) {
+				failOpen(error, "prefix diagnostics");
+			}
 		};
 
 		pi.registerTool({
@@ -134,22 +287,19 @@ export function createObservationPackExtension(): ExtensionFactory {
 			},
 		});
 
-		pi.on("context", async (event, ctx: ExtensionContext) => {
-			const projected = [...event.messages];
-			const root = runtimeRoot(ctx);
-			// How many provider requests each message has already been part of,
-			// counted by the assistant messages that follow it.
-			const priorAssistantCounts = new Array<number>(event.messages.length);
-			let assistantCount = 0;
-
-			for (let index = event.messages.length - 1; index >= 0; index -= 1) {
-				priorAssistantCounts[index] = assistantCount;
-				if (event.messages[index]?.role === "assistant") assistantCount += 1;
-			}
-
-			const requestIndex = assistantCount + 1;
-			for (let index = 0; index < event.messages.length; index += 1) {
-				const message = event.messages[index];
+		const projectLegacy = async (
+			messages: readonly AgentMessage[],
+			ctx: ExtensionContext,
+			root: string,
+			state: RootState,
+			priorAssistantCounts: readonly number[],
+			requestIndex: number,
+			continuation: boolean,
+		): Promise<AgentMessage[]> => {
+			const projected = [...messages];
+			const swapped: number[] = [];
+			for (let index = 0; index < messages.length; index += 1) {
+				const message = messages[index];
 				if (!message || !isPureTextResult(message)) continue;
 
 				try {
@@ -160,7 +310,7 @@ export function createObservationPackExtension(): ExtensionFactory {
 					const sendCountKey = `${root}\0${observation.id}`;
 					const previousSends = sentCounts.get(sendCountKey) ?? priorAssistantCounts[index] ?? 0;
 					if (previousSends < FULL_SENDS) {
-						await ledgerFor(ctx)({
+						await recordOnce(root, state, {
 							event: "full",
 							id: observation.id,
 							request: requestIndex,
@@ -177,7 +327,8 @@ export function createObservationPackExtension(): ExtensionFactory {
 					const placeholder = placeholderFor(observation);
 					const placeholderTokens = estimateTokens(placeholder);
 					const removedTokens = Math.max(0, observation.tokens - placeholderTokens);
-					await ledgerFor(ctx)({
+					const first = !state.placeholders.has(observation.id);
+					await recordOnce(root, state, {
 						event: "placeholder",
 						id: observation.id,
 						request: requestIndex,
@@ -189,6 +340,7 @@ export function createObservationPackExtension(): ExtensionFactory {
 						placeholderBytes: Buffer.byteLength(placeholder, "utf8"),
 						placeholderTokens,
 						removedTokens,
+						...(first ? { flushReason: "legacy" satisfies FlushReason } : {}),
 					});
 					if (previousSends === FULL_SENDS) {
 						showSolPiSavings(
@@ -199,18 +351,240 @@ export function createObservationPackExtension(): ExtensionFactory {
 					}
 					projected[index] = { ...message, content: [{ type: "text", text: placeholder }] };
 					sentCounts.set(sendCountKey, previousSends + 1);
+					if (first) {
+						state.placeholders.add(observation.id);
+						swapped.push(index);
+					}
 				} catch (error) {
 					// Fail open: a packing failure must never cost the agent its observation.
-					const reason = error instanceof Error ? error.message : String(error);
-					console.error(`[observationpack] fail-open for tool result: ${reason}`);
+					failOpen(error, "tool result");
 				}
 			}
 
-			return { messages: projected };
+			if (prefixDiagnostics) {
+				try {
+					const beforeSwap = [...projected];
+					for (const index of swapped) beforeSwap[index] = messages[index] as AgentMessage;
+					const view = inspectRequest(state, beforeSwap, ctx, continuation);
+					await writeDiagnostics(root, requestIndex, view, { count: 0, tokens: 0 }, "legacy", swapped.length);
+					if (continuation) state.previous = { request: requestIndex, fingerprints: projected.map(messageFingerprint) };
+				} catch (error) {
+					failOpen(error, "prefix diagnostics");
+				}
+			}
+			return projected;
+		};
+
+		const projectBatched = async (
+			messages: readonly AgentMessage[],
+			ctx: ExtensionContext,
+			root: string,
+			state: RootState,
+			priorAssistantCounts: readonly number[],
+			requestIndex: number,
+			continuation: boolean,
+		): Promise<AgentMessage[]> => {
+			// Classify every large result. The send count is derived from history,
+			// so a repeated `context` call for the same request cannot advance it.
+			// An already-swapped observation stays a placeholder whatever the count
+			// (a rewind or tree navigation can leave fewer assistants after it).
+			const candidates: Candidate[] = [];
+			for (let index = 0; index < messages.length; index += 1) {
+				const message = messages[index];
+				try {
+					if (!message || !isPureTextResult(message)) continue;
+					const observation = createObservation(message, root);
+					if (!observation) continue;
+					await ensureStored(observation);
+					const previousSends = priorAssistantCounts[index] ?? 0;
+					const sendNumber = previousSends + 1;
+					const swapped = state.placeholders.has(observation.id);
+					if (!swapped && previousSends < FULL_SENDS) {
+						candidates.push({ index, observation, sendNumber, kind: "full" });
+						continue;
+					}
+					const text = placeholderFor(observation);
+					const tokens = estimateTokens(text);
+					candidates.push({
+						index,
+						observation,
+						sendNumber,
+						kind: swapped ? "placeholder" : "pending",
+						swap: {
+							message: { ...message, content: [{ type: "text", text }] },
+							bytes: Buffer.byteLength(text, "utf8"),
+							tokens,
+							removedTokens: Math.max(0, observation.tokens - tokens),
+						},
+					});
+				} catch (error) {
+					failOpen(error, "tool result");
+				}
+			}
+
+			// Decide which pending observations swap on this request.
+			const pending = candidates.filter((candidate) => candidate.kind === "pending");
+			const pendingTokens = pending.reduce((total, candidate) => total + (candidate.swap?.removedTokens ?? 0), 0);
+			const beforeFlush = [...messages];
+			for (const candidate of candidates) {
+				if (candidate.kind === "placeholder" && candidate.swap) beforeFlush[candidate.index] = candidate.swap.message;
+			}
+			let view: RequestView | undefined;
+			let flushReason: FlushReason | undefined;
+			let flushing = new Set<number>();
+			try {
+				view = inspectRequest(state, beforeFlush, ctx, continuation);
+				const { gapMs, modelChanged } = view.timing;
+				// A non-continuation call (steering, side turn) only re-sends existing placeholders.
+				const flushAll: FlushReason | undefined = !continuation
+					? undefined
+					: !view.previous
+					? "process-start"
+					: modelChanged
+						? "model-change"
+						: gapMs !== undefined && gapMs >= coldGapMs
+							? "cold-gap"
+							: pendingTokens >= batchThresholdTokens
+								? "threshold"
+								: undefined;
+				if (flushAll) {
+					flushReason = flushAll;
+					flushing = new Set(pending.map((candidate) => candidate.index));
+				} else if (continuation && view.firstChanged !== undefined) {
+					// The cache already breaks at firstChanged; swapping anything earlier would move the break up.
+					const from = view.firstChanged;
+					flushReason = "prefix-changed";
+					flushing = new Set(pending.flatMap((candidate) => (candidate.index >= from ? [candidate.index] : [])));
+				}
+			} catch (error) {
+				failOpen(error, "observation batching");
+				flushReason = undefined;
+				flushing = new Set();
+			}
+
+			// Project and record in message order.
+			const projected = [...messages];
+			let flushedCount = 0;
+			for (const candidate of candidates) {
+				const { index, observation, sendNumber, swap } = candidate;
+				try {
+					const swapNow = candidate.kind === "placeholder" || flushing.has(index);
+					if (!swap || !swapNow) {
+						await recordOnce(root, state, {
+							event: "full",
+							id: observation.id,
+							request: requestIndex,
+							tool: observation.toolName,
+							originalBytes: observation.bytes,
+							originalLines: observation.lines,
+							originalTokens: observation.tokens,
+							contentHash: observation.contentHash,
+							...(candidate.kind === "pending" ? { deferred: true } : {}),
+						});
+						continue;
+					}
+					// Decide "first" and reserve the placeholder before any await so a concurrent
+					// call for the same root neither re-flushes nor re-toasts this observation.
+					const first = !state.placeholders.has(observation.id);
+					if (first) state.placeholders.add(observation.id);
+					try {
+						await recordOnce(root, state, {
+							event: "placeholder",
+							id: observation.id,
+							request: requestIndex,
+							sendNumber,
+							tool: observation.toolName,
+							originalBytes: observation.bytes,
+							originalLines: observation.lines,
+							originalTokens: observation.tokens,
+							placeholderBytes: swap.bytes,
+							placeholderTokens: swap.tokens,
+							removedTokens: swap.removedTokens,
+							...(first ? { flushReason } : {}),
+						});
+					} catch (error) {
+						if (first) state.placeholders.delete(observation.id);
+						throw error;
+					}
+					projected[index] = swap.message;
+					if (first) {
+						flushedCount += 1;
+						showSolPiSavings(
+							ctx,
+							"Observation Pack",
+							formatSavingsCount(swap.removedTokens, "context tokens avoided"),
+						);
+					}
+				} catch (error) {
+					// Fail open: a packing failure must never cost the agent its observation.
+					failOpen(error, "tool result");
+				}
+			}
+
+			if (view) {
+				try {
+					const fingerprints = [...view.fingerprints];
+					for (const { index } of candidates) {
+						if (projected[index] !== beforeFlush[index]) fingerprints[index] = messageFingerprint(projected[index]);
+					}
+					if (continuation) state.previous = { request: requestIndex, fingerprints };
+				} catch (error) {
+					failOpen(error, "observation batching");
+				}
+				if (prefixDiagnostics) {
+					await writeDiagnostics(
+						root,
+						requestIndex,
+						view,
+						{ count: pending.length, tokens: pendingTokens },
+						flushReason,
+						flushedCount,
+					);
+				}
+			}
+			return projected;
+		};
+
+		pi.on("context", async (event, ctx: ExtensionContext) => {
+			let root: string;
+			try {
+				root = runtimeRoot(ctx);
+			} catch (error) {
+				failOpen(error, "context");
+				return undefined;
+			}
+			const state = stateFor(root);
+			const legacy = batchThresholdTokens === 0;
+			// A side turn (omp `/btw`) is not part of the main request stream: its replayed
+			// answers do not count as sends, and it neither flushes nor becomes the previous request.
+			let side: number | undefined;
+			try {
+				side = legacy ? undefined : sideTurnStart(event.messages);
+			} catch (error) {
+				failOpen(error, "side turn");
+			}
+			const mainEnd = side ?? event.messages.length;
+			// How many provider requests each message has already been part of,
+			// counted by the assistant messages that follow it.
+			const priorAssistantCounts = new Array<number>(event.messages.length);
+			let assistantCount = 0;
+
+			for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+				priorAssistantCounts[index] = assistantCount;
+				if (index < mainEnd && event.messages[index]?.role === "assistant") assistantCount += 1;
+			}
+
+			const requestIndex = assistantCount + 1;
+			const continuation = assistantCount > 0 && side === undefined;
+			const project = legacy ? projectLegacy : projectBatched;
+			return {
+				messages: await project(event.messages, ctx, root, state, priorAssistantCounts, requestIndex, continuation),
+			};
 		});
 	};
 }
 
+export { DEFAULT_BATCH_THRESHOLD_TOKENS, DEFAULT_COLD_GAP_MS, type FlushReason } from "./batching.ts";
 export {
 	createObservation,
 	FULL_SENDS,
@@ -220,8 +594,8 @@ export {
 	THRESHOLD_BYTES,
 } from "./observation.ts";
 
-export function registerObservationPack(pi: ExtensionAPI): void {
-	createObservationPackExtension()(pi);
+export function registerObservationPack(pi: ExtensionAPI, options: ObservationPackOptions = {}): void {
+	createObservationPackExtension(options)(pi);
 }
 
 export default registerObservationPack;

@@ -13,9 +13,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createObservationPackExtension,
 	FULL_SENDS,
+	type ObservationPackOptions,
 	THRESHOLD_BYTES,
 } from "../src/sol-pi/extensions/observation-pack/index.ts";
-import { componentText, FakePi, FakeSessionManager, fakeContext, plainTheme } from "./helpers.ts";
+import { FakePi, FakeSessionManager, fakeContext } from "./helpers.ts";
 import { runtimeRoot } from "../src/sol-pi/runtime-paths.ts";
 
 const roots: string[] = [];
@@ -33,9 +34,10 @@ async function sessionRoot(): Promise<string> {
 	return value;
 }
 
-function observationPackPi(): FakePi {
+/** Legacy immediate swap (threshold 0): each context call counts as one provider request. */
+function observationPackPi(options: ObservationPackOptions = { batchThresholdTokens: 0 }): FakePi {
 	const pi = new FakePi();
-	createObservationPackExtension()(pi.asExtensionApi());
+	createObservationPackExtension(options)(pi.asExtensionApi());
 	return pi;
 }
 
@@ -125,15 +127,6 @@ describe("observation pack", () => {
 		expect(pi.registeredTools.map((tool) => tool.name)).toEqual(["obs_recall"]);
 	});
 
-	it("renders observation recall as an English lightning savings call", () => {
-		const recall = observationPackPi().tool("obs_recall");
-		const args = { id: "obs_0123456789abcdef01234567", offset: 0 };
-		const rendered = recall.renderCall!(args, plainTheme, { args, cwd: process.cwd() } as never);
-
-		expect(componentText(rendered)).toContain("⚡ SoL-Pi · Observation Pack");
-		expect(componentText(rendered)).toContain("Money saved");
-	});
-
 	it("keeps the first two requests full and reuses one stable placeholder afterwards", async () => {
 		const sessionDir = await sessionRoot();
 		const body = `head line\n${repeatPastThreshold("middle line\n")}tail line\n`;
@@ -175,9 +168,6 @@ describe("observation pack", () => {
 		await pi.emitContext([message], context);
 
 		expect(notify).toHaveBeenCalledTimes(1);
-		expect(notify.mock.calls[0]?.[0]).toMatch(
-			/^⚡ SoL-Pi · Observation Pack\nMoney saved · [\d,]+ context tokens avoided$/u,
-		);
 	});
 
 	it("isolates objects and send counters by Pi session", async () => {

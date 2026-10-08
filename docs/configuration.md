@@ -24,11 +24,14 @@ The project file replaces the global file. SoL-Pi does not merge them.
   "evidencePreservingReducerModel": "model-id",
   "onlineContextCompact": false,
   "cacheWriteReadRatio": 12.5,
-  "keepRecentTokens": 20000
+  "keepRecentTokens": 20000,
+  "observationPackBatchThresholdTokens": 20000,
+  "observationPackColdGapMs": 300000,
+  "observationPackPrefixDiagnostics": false
 }
 ```
 
-Feature keys may be omitted and then default to `false`. `cacheWriteReadRatio` may be omitted and then defaults to `12.5`; when present it must be a finite non-negative number, and `0` explicitly means that a cache write adds no cost relative to a cache read. `keepRecentTokens` may be omitted and then defaults to `20000`; when present it must be a positive safe integer and controls the retained tail budget used by Online Context Compact feasibility checks. `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` may be omitted and then use the built-in reducer route; when present each must be a non-empty string. Unknown keys, unsupported versions, malformed JSON, non-boolean feature values, invalid ratios, invalid keep-recent budgets, and invalid reducer model fields stop extension loading with a direct error.
+Feature keys may be omitted and then default to `false`. `cacheWriteReadRatio` may be omitted and then defaults to `12.5`; when present it must be a finite non-negative number, and `0` explicitly means that a cache write adds no cost relative to a cache read. `keepRecentTokens` may be omitted and then defaults to `20000`; when present it must be a positive safe integer and controls the retained tail budget used by Online Context Compact feasibility checks. `observationPackBatchThresholdTokens` may be omitted and then defaults to `20000`; when present it must be a non-negative safe integer, and `0` restores the legacy one-by-one placeholder swap. `observationPackColdGapMs` may be omitted and then defaults to `300000`; when present it must be a positive safe integer. `observationPackPrefixDiagnostics` may be omitted and then defaults to `false`; when present it must be boolean. `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` may be omitted and then use the built-in reducer route; when present each must be a non-empty string. Unknown keys, unsupported versions, malformed JSON, non-boolean feature values, invalid ratios, invalid keep-recent budgets, invalid ObservationPack batching values, and invalid reducer model fields stop extension loading with a direct error.
 
 For the managed all-enabled installation described in the [agent installation and configuration protocol](../agents-install.md), validate the effective file before starting Pi:
 
@@ -44,6 +47,7 @@ This preflight does not make every valid SoL-Pi configuration all-enabled. Witho
 
 - `actionFusion`: registers SoL-Pi replacements for Pi's `edit` and `write` tools.
 - `observationPack`: registers `obs_recall` and a provider-context projection handler.
+- `observationPackBatchThresholdTokens`, `observationPackColdGapMs`, `observationPackPrefixDiagnostics`: tune when ObservationPack swaps pending results for placeholders; see [ObservationPack batching](#observationpack-batching).
 - `evidencePreservingReducer`: registers a `tool_result` handler and delegates long diagnostic-log reduction to the configured reducer provider/model.
 - `evidencePreservingReducerProvider`: provider namespace used to resolve the reducer model through Pi's model registry.
 - `evidencePreservingReducerModel`: model id used for Evidence-Preserving Reducer.
@@ -56,14 +60,29 @@ The release entry supplies the run label and session-derived storage. It uses on
 
 - **Reducer provider/model** — from `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` in the effective `sol-pi.json`. If omitted, SoL-Pi uses its built-in reducer route. SoL-Pi resolves that model through Pi's model registry and still relies on Pi-managed authentication; do not put credentials in `sol-pi.json`.
 
+## ObservationPack batching
+
+A large tool result becomes eligible for its placeholder after its first two provider requests. Swapping it edits the middle of the prompt, which breaks the provider prompt cache from that point, so eligible results wait as *pending* and are still sent in full. All pending results of a session swap together on the first request where one of these holds:
+
+- **threshold** — the pending results would remove at least `observationPackBatchThresholdTokens` tokens in total;
+- **cold-gap** — at least `observationPackColdGapMs` passed since the most recent assistant message, so the cache is likely cold. On omp with prompt-cache warming (`providers.cacheWarming`), the gap is measured from the latest warming refresh instead when it is newer (a `model_usage` session entry with purpose `cache-warm` that read or wrote cache tokens), because that refresh keeps the cache warm;
+- **model-change** — the current model differs from the one that produced the most recent assistant message (skipped when the host does not expose the current model);
+- **process-start** — the first request of a session in this process (restart or resume).
+
+When the projected history changed before its end since the previous request (compaction, native pruning, another extension's rewrite), the cache already breaks at the first changed message, so only pending results at or after that message swap (**prefix-changed**). A swapped result stays a placeholder for every later request. The placeholder text is unchanged. `observationPackBatchThresholdTokens: 0` restores the original behavior: every result swaps on its own third request.
+
+Malformed or unsupported tool-result content remains unchanged in both batching and legacy modes. On omp, interrupted (`aborted` or `error`) main-stream responses are not side-turn answers: the next main request still advances packing and batching decisions.
+
+The ledger at `<session runtime directory>/observation-pack/ledger.jsonl` records the reason on the first `placeholder` row of each result (`flushReason`: `threshold`, `cold-gap`, `model-change`, `prefix-changed`, `process-start`, or `legacy` when the threshold is `0`) and marks pending results sent in full with `"deferred": true`. A result already sent as a placeholder stays a placeholder for the rest of the process, even after a rewind or tree navigation. The ledger writes each (event, observation, request) row at most once per process. The request number is the assistant count plus one, so after compaction or a rewind it can repeat: a result re-sent under an already used request number gets no new row, and a placeholder re-sent after a rewind can carry a `sendNumber` of 2 or less. Offline savings totals built from these rows are therefore a lower bound. A `context` call that carries no assistant message (for example omp live steering, which converts only the newly typed messages) is not treated as a request: it is not compared with, and does not replace, the previous request used for prefix-change detection. The same holds for an omp side turn (`/btw` with earlier side answers, which omp replays as assistant messages after a developer notice): those replayed answers do not count as sends, and the side turn swaps nothing new. With `observationPackPrefixDiagnostics: true`, each `context` call also appends one row to `observation-pack/prefix-ledger.jsonl` with the request number, message counts, first changed index, gap, model change, repeat flag, continuation flag (false for such calls), pending count and tokens, and the flush decision.
+
 ## Online Context Compact runtime inputs
 The release entry uses three runtime inputs:
 
 - **Context window** — from `ExtensionContext.getContextUsage()`, used for window-pressure protection.
 - **Cache write/read ratio** — from `cacheWriteReadRatio` in the effective `sol-pi.json`. The value remains fixed for the session and is not recomputed when the model changes. It drives one runtime decision and is not a cost report.
-- **Keep-recent token budget** — from `keepRecentTokens` in the effective `sol-pi.json`, defaulting to `20000`. It must be a positive safe integer and controls how much recent context the native compaction feasibility check retains.
+- **Keep-recent token budget** — from `keepRecentTokens` in the effective `sol-pi.json`, defaulting to `20000`. It must be a positive safe integer and must match the host's retained-tail setting. It controls the extension's native-compaction feasibility estimate, not the host setting itself.
 
-The configured ratio stays fixed for the loaded extension. The mechanism stores its current plan, progress summaries, request horizon, context growth, and compaction debt as versioned custom entries in Pi's session log. After a successful compaction it sends one hidden, generic message with `triggerTurn: true`, which starts a new turn and asks the assistant to continue the current plan, preserving existing step IDs when updating progress. A settlement barrier keeps print and JSON modes in the same Pi invocation until that continuation settles, so callers do not need to resume the session or inject `Continue working`. Cancelling or exiting does not schedule an automatic continuation. The mechanism creates no separate Online Context Compact files. The programmatic factory exposes only a matching retained-tail value for installations whose Pi compaction setting differs from the default.
+The configured ratio stays fixed for the loaded extension. The mechanism stores its current plan, progress summaries, request horizon, context growth, and compaction debt as versioned custom entries in Pi's session log. After a successful compaction it sends one hidden, generic message with `triggerTurn: true`, which starts a new turn and asks the assistant to continue the current plan, preserving existing step IDs when updating progress. A settlement barrier keeps print and JSON modes in the same Pi invocation until that continuation settles, so callers do not need to resume the session or inject `Continue working`. Supported recoverable compaction refusals resume with the existing context. Cancellation, exit, and unexpected compaction failures do not schedule an automatic continuation. On omp, compaction runs at `turn_end`; an idle session alone is not permission to resume a cancelled or failed operation. The mechanism creates no separate Online Context Compact files.
 
 ## Pi integration
 

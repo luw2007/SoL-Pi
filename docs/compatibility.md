@@ -23,6 +23,8 @@ On Windows it applies the same drive-path conversion Pi's own resolver applies, 
 
 The queue covers only fused operations registered by this SoL-Pi instance. External processes, direct built-in-tool calls outside the replacement, and unrelated extensions are not globally locked. SoL-Pi hashes the target immediately before launching `then_run` and skips the command if it observes an intervening content change.
 
+Successful fused commands preserve the mutation's edit metadata and the bash result's truncation metadata, including `fullOutputPath`. Evidence-Preserving Reducer uses that authoritative path to recover a truncated log before considering a path printed in inline command output.
+
 ## ObservationPack
 
 ObservationPack changes only the messages projected through the public `context` event. Stored session history remains intact. Original bytes and the JSONL ledger live under the session-derived SoL-Pi directory.
@@ -43,7 +45,7 @@ The native cut is selected from session entries, while removable-token savings a
 
 Compaction preserves the current plan, request-horizon samples, and context-growth history. Every plan update uses the same step-ID/status comparison, including the first update after compaction. A boundary requires a previously registered unfinished step to become completed. Newly introduced completed IDs establish history without creating a boundary, so re-keyed completed snapshots do not retrigger compaction. An assistant must register a step before completing it to make that completion eligible for OCC. Economic compaction has a two-provider-request cooldown; context-window protection can override it. A new user task following a fully completed plan resets the request-horizon samples while preserving unpaid cache debt.
 
-Pi does not expose its active retained-tail compaction setting through the public extension context. The standalone extension therefore uses the Pi 0.85.1 default of 20,000 tokens for its economic estimate. Its programmatic factory accepts an explicit matching value for a non-default Pi setting.
+Pi does not expose its active retained-tail compaction setting through the public extension context. The standalone extension therefore uses `keepRecentTokens` from `sol-pi.json`, defaulting to the Pi 0.85.1 budget of 20,000 tokens, for its economic estimate. Set it to match a non-default host setting; the programmatic factory also accepts an explicit budget. This value informs feasibility and savings estimates; it does not change the host's compaction setting.
 
 Pi 0.85.1's `ExtensionContext.compact()` aborts the active agent before it summarizes, and `agent_settled` fires only once a whole run has drained every turn, retry, auto-compaction, and queued continuation. A plan boundary that selects compaction therefore saves its plan and progress state, calls `ExtensionContext.abort()` to stop the run, and runs compaction from the `agent_settled` that stop produces. The handler awaits the compaction's own `onComplete`/`onError` callbacks. On success, the extension sends a hidden reminder through public `ExtensionAPI.sendMessage()` with `triggerTurn: true`, so Pi starts a new turn against the compacted context and continues the current plan. The reminder asks it to preserve existing step IDs when updating progress; an immediate plan update is not required.
 

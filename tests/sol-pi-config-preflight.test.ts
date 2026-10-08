@@ -79,6 +79,43 @@ describe("SoL-Pi configuration preflight", () => {
 		expect(result.stderr).toContain("keepRecentTokens must be a positive safe integer");
 	});
 
+	it("applies default ObservationPack batching values when omitted", () => {
+		const result = run(writeConfig(ALL_ENABLED));
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout).effective_config).toMatchObject({
+			observationPackBatchThresholdTokens: 20_000,
+			observationPackColdGapMs: 300_000,
+			observationPackPrefixDiagnostics: false,
+		});
+	});
+
+	it("accepts explicit ObservationPack batching values, including a zero threshold", () => {
+		const configured = {
+			observationPackBatchThresholdTokens: 0,
+			observationPackColdGapMs: 1,
+			observationPackPrefixDiagnostics: true,
+		};
+		const result = run(writeConfig({ ...ALL_ENABLED, ...configured }));
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout).effective_config).toMatchObject(configured);
+	});
+
+	it.each([
+		["observationPackBatchThresholdTokens", -1, "must be a non-negative safe integer"],
+		["observationPackBatchThresholdTokens", 1.5, "must be a non-negative safe integer"],
+		["observationPackBatchThresholdTokens", "20000", "must be a non-negative safe integer"],
+		["observationPackBatchThresholdTokens", null, "must be a non-negative safe integer"],
+		["observationPackColdGapMs", 0, "must be a positive safe integer"],
+		["observationPackColdGapMs", 1.5, "must be a positive safe integer"],
+		["observationPackColdGapMs", null, "must be a positive safe integer"],
+		["observationPackPrefixDiagnostics", "true", "must be boolean"],
+		["observationPackPrefixDiagnostics", null, "must be boolean"],
+	] as const)("rejects an invalid ObservationPack batching value: %s=%j", (key, value, message) => {
+		const result = run(writeConfig({ ...ALL_ENABLED, [key]: value }));
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(`${key} ${message}`);
+	});
+
 	it("applies the default ratio when the field is omitted", () => {
 		const { cacheWriteReadRatio: _ratio, ...withoutRatio } = ALL_ENABLED;
 		const result = run(writeConfig(withoutRatio));
