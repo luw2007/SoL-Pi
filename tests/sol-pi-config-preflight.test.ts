@@ -48,6 +48,7 @@ const ALL_ENABLED = {
 	evidencePreservingReducerModel: DEFAULT_EPR_MODEL,
 	onlineContextCompact: true,
 	cacheWriteReadRatio: 12.5,
+	keepRecentTokens: 20_000,
 };
 
 describe("SoL-Pi configuration preflight", () => {
@@ -63,6 +64,19 @@ describe("SoL-Pi configuration preflight", () => {
 				evidencePreservingReducerModel: DEFAULT_EPR_MODEL,
 			},
 		});
+	});
+
+	it("applies default keepRecentTokens when omitted", () => {
+		const { keepRecentTokens: _keepRecentTokens, ...withoutKeepRecentTokens } = ALL_ENABLED;
+		const result = run(writeConfig(withoutKeepRecentTokens));
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout).effective_config.keepRecentTokens).toBe(20_000);
+	});
+
+	it.each([0, -1, 1.5, "20000", null])("rejects invalid keepRecentTokens: %j", (keepRecentTokens) => {
+		const result = run(writeConfig({ ...ALL_ENABLED, keepRecentTokens }));
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("keepRecentTokens must be a positive safe integer");
 	});
 
 	it("applies the default ratio when the field is omitted", () => {

@@ -2,13 +2,16 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  */
+import { join } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import {
 	estimateTokens,
 	type ExtensionContext,
 	type ExtensionFactory,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { runtimeRoot } from "../../runtime-paths.ts";
 import { formatSavingsCount, showSolPiSavings } from "../../tui.ts";
 import {
 	DEFAULT_COMPACTION_ECONOMICS,
@@ -17,6 +20,7 @@ import {
 } from "./economics.ts";
 import { analyzePlanTransition, formatPlanSnapshot, parsePlanSteps } from "./plan.ts";
 import { estimateProjectedCompactionTokens } from "./projection.ts";
+import { createCompactionLedger, type CompactionLedger } from "./ledger.ts";
 import {
 	appendOnlineState,
 	initialOnlineState,
@@ -30,7 +34,17 @@ import {
 	type ProgressSummary,
 } from "./state.ts";
 import { registerOnlineTools, type PlanUpdateInput } from "./tools.ts";
+import { classifyTurnEnd } from "./turn-end-classifier.ts";
 
+/*
+ * omp compat: omp has no `agent_settled` event, and `context.compact()` itself
+ * ends the running agent loop (the session is idle by the time `onComplete`
+ * fires). It also skips `session_stop` for aborted loops. So on omp the
+ * boundary compaction runs inline from `turn_end` and the continuation turn is
+ * started directly once the session reports idle, instead of the
+ * abort → agent_settled → compact → continue sequence pi uses.
+ */
+const ompHost = piCodingAgent.CONFIG_DIR_NAME === ".omp";
 export const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
 export const DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE = 1_000;
 export const BOUNDARY_COMPACTION_INSTRUCTIONS =
@@ -61,6 +75,7 @@ type PendingBoundary = { readonly toolCallId: string };
 type SelectedCompaction = { readonly decision: CompactionDecision };
 type CacheDebt = { readonly debtTokens: number; readonly repaymentTokens: number };
 type PendingContinuation = { readonly promise: Promise<void>; readonly resolve: () => void };
+type BoundaryCompactionOutcome = { compacted: boolean; recoverable: boolean; failure: Error | undefined };
 type CompactionTokenSettings = { readonly keepRecentTokens: number; readonly reserveTokens: number };
 type SettingsSource = { readonly getSettings?: () => unknown };
 
@@ -82,6 +97,12 @@ function resolveCacheWriteReadRatio(value: number | null | undefined): number | 
 
 function tokenEstimate(text: string): number {
 	return Math.ceil(Buffer.byteLength(text) / 4);
+}
+
+// omp compat: getSystemPrompt() returns string[] (one entry per prompt section) in omp.
+function systemPromptTokens(context: ExtensionContext): number {
+	const prompt: unknown = context.getSystemPrompt();
+	return tokenEstimate(Array.isArray(prompt) ? prompt.join("\n") : String(prompt ?? ""));
 }
 
 function result(text: string, details: Readonly<Record<string, unknown>>): AgentToolResult<Readonly<Record<string, unknown>>> {
@@ -165,6 +186,17 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		let compactionInFlight = false;
 		let requestPending = false;
 		let compactionRefused = false;
+		let turnEndSeq = 0;
+		const compactionLedgers = new Map<string, CompactionLedger>();
+		const compactionLedgerFor = (context: ExtensionContext): CompactionLedger => {
+			const root = runtimeRoot(context);
+			let ledger = compactionLedgers.get(root);
+			if (!ledger) {
+				ledger = createCompactionLedger(join(root, "online-context-compact", "turn-end-ledger.jsonl"));
+				compactionLedgers.set(root, ledger);
+			}
+			return ledger;
+		};
 
 		const releaseContinuation = (): void => {
 			const continuation = nextContinuation;
@@ -208,7 +240,7 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		};
 		const contextTokens = (context: ExtensionContext): number => {
 			const visible = observedMessages.reduce((total, message) => total + estimateTokens(message), 0);
-			const estimated = visible + tokenEstimate(context.getSystemPrompt());
+			const estimated = visible + systemPromptTokens(context);
 			const reported = context.getContextUsage()?.tokens;
 			return validPositiveInteger(reported) ? Math.max(reported, estimated) : estimated;
 		};
@@ -291,69 +323,144 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			return { action: "continue" as const };
 		});
 
-		pi.on("turn_end", (event, context) => {
+		pi.on("turn_end", async (event, context) => {
 			// Plan chatter cannot make a rejected compact feasible. Require actual
 			// tool work or new user input before attempting another boundary.
 			if (event.toolResults.some((item) => item.toolName !== "update_plan" && !item.isError)) compactionRefused = false;
 			const boundary = pendingBoundary;
 			pendingBoundary = undefined;
-			if (!boundary || selected || compactionRefused) return;
-			const toolResult = event.toolResults.find((item) => item.toolCallId === boundary.toolCallId);
-			if (
-				event.message.role !== "assistant" ||
-				event.message.stopReason === "error" ||
-				event.message.stopReason === "aborted" ||
-				context.signal?.aborted ||
-				!toolResult ||
-				toolResult.isError
-			) {
+			const toolResult = boundary
+				? event.toolResults.find((item) => item.toolCallId === boundary.toolCallId)
+				: undefined;
+			const classification = classifyTurnEnd({
+				hasPendingBoundary: Boolean(boundary),
+				hasAlreadySelected: Boolean(selected),
+				messageRole: event.message.role,
+				stopReason: event.message.role === "assistant" ? event.message.stopReason : undefined,
+				contextAborted: Boolean(context.signal?.aborted),
+				toolResultFound: Boolean(toolResult),
+				toolResultIsError: Boolean(toolResult?.isError),
+			});
+
+			let decision: CompactionDecision | undefined;
+			if (classification.decisionEvaluated && !compactionRefused) {
+				const { keepRecentTokens, reserveTokens } = compactionSettings(context);
+				const usage = context.getContextUsage();
+				const writeTokens = contextTokens(context);
+				const archiveTokens = estimateNativeCompactionTokens(
+					context.sessionManager.getBranch(),
+					keepRecentTokens,
+					observedMessages,
+				);
+				const contextWindowTokens = validPositiveInteger(usage?.contextWindow)
+					? usage.contextWindow
+					: validPositiveInteger(context.model?.contextWindow)
+						? context.model.contextWindow
+						: null;
+				const averageContextTokenIncrement =
+					state.positiveContextDeltaCount === 0
+						? null
+						: state.positiveContextDeltaTotal / state.positiveContextDeltaCount;
+				const priced = decideCompaction({
+					writeTokens,
+					archiveTokens,
+					memoTokens: DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE,
+					contextTokens: writeTokens,
+					completedBoundaryRequestCounts: state.completedBoundaryRequestCounts,
+					remainingBoundaries: state.plan.filter((step) => step.status !== "completed").length,
+					averageContextTokenIncrement,
+					contextWindowTokens,
+					priorCompactionCount: state.nativeCompactionCount,
+					requestsSinceLastCompaction:
+						state.lastCompactionRequestCount === null
+							? null
+							: state.requestCount - state.lastCompactionRequestCount,
+					carriedDebtTokens: state.cacheDebtTokens,
+					cacheDebtRepaymentTokens: state.cacheDebtRepaymentTokens,
+					cacheWriteReadRatio,
+					economics: { ...DEFAULT_COMPACTION_ECONOMICS, windowReserveTokens: reserveTokens },
+				});
+				decision =
+					priced.compact && archiveTokens === 0
+						? { ...priced, compact: false, reason: "native_not_compactable" }
+						: priced;
+			}
+
+			// The ledger write is fired here but NOT awaited yet: `selected` /
+			// `context.abort()` below must happen synchronously, in the same
+			// tick as this handler resumes, with no `await` in between. On pi
+			// (non-omp), `context.abort()` triggers `agent_settled` -> compact
+			// consumption of `selected` (comment below, and the handler at
+			// `pi.on("agent_settled", ...)`), and the host does not wait for
+			// this turn_end handler's own promise to settle first. Awaiting the
+			// ledger write before the handoff would let that consumption race
+			// ahead of `selected` ever being set, silently dropping every
+			// compaction. Every return path below still awaits `ledgerWrite`
+			// before resolving, so the ledger keeps exactly one fail-open entry
+			// per invocation — it is just no longer on the handoff's critical
+			// path.
+			turnEndSeq += 1;
+			let ledgerWrite: Promise<void> = Promise.resolve();
+			try {
+				ledgerWrite = compactionLedgerFor(context)({
+					event: "turn_end_classification",
+					turnEndSeq,
+					bucket: classification.bucket,
+					decisionEvaluated: classification.decisionEvaluated,
+					reason: decision?.reason ?? classification.bucket,
+					willCompact: decision?.compact ?? false,
+					requestCountAtEmit: state.requestCount,
+					raw: classification.raw,
+				}).catch((error) => {
+					// Fail-open: an async ledger write failure must never cost the
+					// turn its actual compaction decision.
+					const reason = error instanceof Error ? error.message : String(error);
+					console.error(`[online-context-compact] fail-open turn_end ledger: ${reason}`);
+				});
+			} catch (error) {
+				// Fail-open: a synchronous ledger failure (e.g. runtimeRoot()
+				// requiring a persistent session directory) must never cost the
+				// turn its actual compaction decision either.
+				const reason = error instanceof Error ? error.message : String(error);
+				console.error(`[online-context-compact] fail-open turn_end ledger: ${reason}`);
+			}
+
+			if (!decision || !decision.compact) {
+				await ledgerWrite;
 				return;
 			}
 
-			const { keepRecentTokens, reserveTokens } = compactionSettings(context);
-			const usage = context.getContextUsage();
-			const writeTokens = contextTokens(context);
-			const archiveTokens = estimateNativeCompactionTokens(
-				context.sessionManager.getBranch(),
-				keepRecentTokens,
-				observedMessages,
-			);
-			const contextWindowTokens = validPositiveInteger(usage?.contextWindow)
-				? usage.contextWindow
-				: validPositiveInteger(context.model?.contextWindow)
-					? context.model.contextWindow
-					: null;
-			const averageContextTokenIncrement =
-				state.positiveContextDeltaCount === 0
-					? null
-					: state.positiveContextDeltaTotal / state.positiveContextDeltaCount;
-			const priced = decideCompaction({
-				writeTokens,
-				archiveTokens,
-				memoTokens: DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE,
-				contextTokens: writeTokens,
-				completedBoundaryRequestCounts: state.completedBoundaryRequestCounts,
-				remainingBoundaries: state.plan.filter((step) => step.status !== "completed").length,
-				averageContextTokenIncrement,
-				contextWindowTokens,
-				priorCompactionCount: state.nativeCompactionCount,
-				requestsSinceLastCompaction:
-					state.lastCompactionRequestCount === null
-						? null
-						: state.requestCount - state.lastCompactionRequestCount,
-				carriedDebtTokens: state.cacheDebtTokens,
-				cacheDebtRepaymentTokens: state.cacheDebtRepaymentTokens,
-				cacheWriteReadRatio,
-				economics: { ...DEFAULT_COMPACTION_ECONOMICS, windowReserveTokens: reserveTokens },
-			});
-			const decision: CompactionDecision =
-				priced.compact && archiveTokens === 0
-					? { ...priced, compact: false, reason: "native_not_compactable" }
-					: priced;
-			if (!decision.compact) return;
-
 			selected = { decision };
-			context.abort();
+			if (!ompHost) {
+				context.abort();
+				await ledgerWrite;
+				return;
+			}
+			await ledgerWrite;
+
+			// omp's compact() ends the agent loop before deciding whether it can
+			// compact, so the continuation is decided by its outcome below.
+			selected = undefined;
+			// A compaction or recoverable refusal keeps the task running; host
+			// cancellation resumes nothing, and a genuine failure is thrown without
+			// restarting a turn the user stopped.
+			let outcome: BoundaryCompactionOutcome;
+			try {
+				outcome = await runBoundaryCompaction({ decision }, context);
+			} finally {
+				activeDebt = undefined;
+			}
+			if (outcome.failure) throw outcome.failure;
+			if (outcome.compacted || outcome.recoverable) {
+				pi.sendMessage(
+					{
+						customType: "sol-pi-online-context-compact",
+						content: outcome.recoverable ? SKIPPED_COMPACTION_REMINDER : POST_COMPACTION_PLAN_REMINDER,
+						display: false,
+					},
+					{ triggerTurn: true },
+				);
+			}
 		});
 
 		// Resume the parent task after a boundary compaction. Pi before 0.87 starts the requested turn
@@ -388,6 +495,75 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			await continuation.promise;
 		};
 
+		// Runs the native compaction for a selected boundary and reports its outcome:
+		// `compacted`, a `recoverable` native refusal (recorded as a skip), or a genuine
+		// `failure`. Host cancellation yields none of the three. omp's compact() returns a
+		// promise that rejects instead of calling onError, so both paths are collected.
+		const runBoundaryCompaction = async (
+			pending: SelectedCompaction,
+			context: ExtensionContext,
+		): Promise<BoundaryCompactionOutcome> => {
+			activeDebt = {
+				debtTokens: pending.decision.postCompactionTokens * (pending.decision.incrementalCacheCostRatio ?? 0),
+				repaymentTokens: Math.max(0, pending.decision.archiveTokens - pending.decision.memoTokens),
+			};
+			let compacted = false;
+			let compactionError: Error | undefined;
+			try {
+				compactionInFlight = true;
+				await new Promise<void>((resolve) => {
+					let finished = false;
+					const finish = (): void => {
+						if (finished) return;
+						finished = true;
+						resolve();
+					};
+					Promise.resolve(
+						context.compact({
+							customInstructions: BOUNDARY_COMPACTION_INSTRUCTIONS,
+							onComplete: (compaction) => {
+								try {
+									compacted = true;
+									const removed = Math.max(
+										0,
+										pending.decision.archiveTokens - tokenEstimate(compaction.summary),
+									);
+									if (removed > 0) {
+										showSolPiSavings(
+											context,
+											"Online Context Compact",
+											formatSavingsCount(removed, "context tokens removed"),
+										);
+									}
+								} finally {
+									finish();
+								}
+							},
+							onError: (error) => {
+								activeDebt = undefined;
+								compactionError = error;
+								finish();
+							},
+						}) as unknown,
+					).catch((error: unknown) => {
+						activeDebt = undefined;
+						compactionError = error instanceof Error ? error : new Error(String(error));
+						finish();
+					});
+				});
+			} finally {
+				compactionInFlight = false;
+			}
+			const failure = compactionError && !isUserAbort(compactionError) ? compactionError : undefined;
+			const recoverable = failure !== undefined && RECOVERABLE_COMPACTION_ERRORS.has(failure.message);
+			if (recoverable) {
+				compactionRefused = true;
+				pi.appendEntry("sol-pi-online-context-compact-skipped", { reason: failure!.message });
+				if (context.mode === "tui") context.ui.notify(`Online compaction skipped: ${failure!.message}`, "warning");
+			}
+			return { compacted, recoverable, failure: recoverable ? undefined : failure };
+		};
+
 		pi.on("agent_settled", async (_event, context) => {
 			// sendMessage() starts a turn without returning its promise. Capture the
 			// child settlement so print/JSON mode cannot dispose while it is running.
@@ -405,65 +581,16 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 				return;
 			}
 
-			activeDebt = {
-				debtTokens: pending.decision.postCompactionTokens * (pending.decision.incrementalCacheCostRatio ?? 0),
-				repaymentTokens: Math.max(0, pending.decision.archiveTokens - pending.decision.memoTokens),
-			};
-			let compacted = false;
-			let compactionError: Error | undefined;
 			try {
-				compactionInFlight = true;
-				await new Promise<void>((resolve) => {
-					let finished = false;
-					const finish = (): void => {
-						if (finished) return;
-						finished = true;
-						resolve();
-					};
-					context.compact({
-						customInstructions: BOUNDARY_COMPACTION_INSTRUCTIONS,
-						onComplete: (compaction) => {
-							try {
-								compacted = true;
-								const removed = Math.max(
-									0,
-									pending.decision.archiveTokens - tokenEstimate(compaction.summary),
-								);
-								if (removed > 0) {
-									showSolPiSavings(
-										context,
-										"Online Context Compact",
-										formatSavingsCount(removed, "context tokens removed"),
-									);
-								}
-							} finally {
-								finish();
-							}
-						},
-						onError: (error) => {
-							activeDebt = undefined;
-							compactionError = error;
-							finish();
-						},
-					});
-				});
-				compactionInFlight = false;
-				const failure = compactionError && !isUserAbort(compactionError) ? compactionError : undefined;
-				const recoverableError = failure !== undefined && RECOVERABLE_COMPACTION_ERRORS.has(failure.message);
-				if (recoverableError) {
-					compactionRefused = true;
-					pi.appendEntry("sol-pi-online-context-compact-skipped", { reason: failure!.message });
-					if (context.mode === "tui") context.ui.notify(`Online compaction skipped: ${failure!.message}`, "warning");
-				}
+				const { compacted, recoverable, failure } = await runBoundaryCompaction(pending, context);
 
 				// The run was stopped for this compaction, so resume it unless the user cancelled.
 				// Known native refusals are recorded as skips; other failures still propagate after resuming.
 				if (compacted) await continueParentTask(context, POST_COMPACTION_PLAN_REMINDER);
-				else if (recoverableError) await continueParentTask(context, SKIPPED_COMPACTION_REMINDER);
+				else if (recoverable) await continueParentTask(context, SKIPPED_COMPACTION_REMINDER);
 				else if (failure) await continueParentTask(context, COMPACTION_FAILED_RESUME_REMINDER);
-				if (failure && !recoverableError) throw failure;
+				if (failure) throw failure;
 			} finally {
-				compactionInFlight = false;
 				activeDebt = undefined;
 				releaseParentContinuation(parentContinuation);
 			}

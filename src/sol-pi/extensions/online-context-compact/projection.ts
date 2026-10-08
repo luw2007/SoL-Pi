@@ -4,16 +4,79 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import * as pi from "@earendil-works/pi-coding-agent";
-import { estimateTokens, findCutPoint, sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
 type ProjectedEntry = { readonly sourceEntry: SessionEntry; readonly messages: readonly AgentMessage[] };
-type ProjectionApi = {
-	readonly buildSessionProjection?: (entries: SessionEntry[]) => { readonly entries: readonly ProjectedEntry[] };
+type CutPointResult = {
+	readonly firstKeptEntryIndex: number;
+	readonly turnStartIndex: number;
+	readonly isSplitTurn: boolean;
 };
+
+/*
+ * omp compat: the oh-my-pi (omp) harness re-exports a reduced
+ * `@earendil-works/pi-coding-agent` surface that omits `findCutPoint`,
+ * `sessionEntryToContextMessages` and `buildSessionProjection`. Resolve them at
+ * runtime and fall back to local equivalents when the host does not export them.
+ * Unchecked cast: the host module namespace is structurally opaque here.
+ */
+type HostApi = {
+	readonly buildSessionProjection?: (entries: SessionEntry[]) => { readonly entries: readonly ProjectedEntry[] };
+	readonly findCutPoint?: (
+		entries: readonly SessionEntry[],
+		startIndex: number,
+		endIndex: number,
+		keepRecentTokens: number,
+	) => CutPointResult;
+	readonly sessionEntryToContextMessages?: (entry: SessionEntry) => readonly AgentMessage[];
+};
+const host = pi as unknown as HostApi;
+
+function entryMessage(entry: SessionEntry): AgentMessage | undefined {
+	if (!entry || typeof entry !== "object" || !("message" in entry)) return undefined;
+	// Unchecked cast: session entries that carry a message carry an agent message.
+	return entry.message as AgentMessage;
+}
+
+function sessionEntryToContextMessages(entry: SessionEntry): readonly AgentMessage[] {
+	if (host.sessionEntryToContextMessages) return host.sessionEntryToContextMessages(entry);
+	if (entry.type === "compaction") {
+		return [{ role: "compactionSummary", summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0 } as unknown as AgentMessage];
+	}
+	const message = entryMessage(entry);
+	return message ? [message] : [];
+}
+
+function findCutPoint(
+	entries: readonly SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+	keepRecentTokens: number,
+): CutPointResult {
+	if (host.findCutPoint) return host.findCutPoint(entries, startIndex, endIndex, keepRecentTokens);
+	// Token-walk the tail backwards; the first entry that no longer fits in the
+	// retained budget ends the compactable history. Turn splitting is a host-only
+	// refinement, so report a whole-entry cut.
+	let kept = 0;
+	let firstKeptEntryIndex = endIndex;
+	for (let index = endIndex - 1; index >= startIndex; index--) {
+		const entry = entries[index];
+		if (!entry) continue;
+		if (sessionEntryToContextMessages(entry).length === 0) {
+			firstKeptEntryIndex = index;
+			continue;
+		}
+		const message = entryMessage(entry);
+		if (message) kept += estimateTokens(message);
+		if (kept > keepRecentTokens) break;
+		firstKeptEntryIndex = index;
+	}
+	return { firstKeptEntryIndex, turnStartIndex: -1, isSplitTurn: false };
+}
 
 /** Pi 1.0 applies context edits before choosing a cut; older Pi uses raw messages. */
 function contextEntries(entries: readonly SessionEntry[]): readonly ProjectedEntry[] {
-	const buildProjection = (pi as unknown as ProjectionApi).buildSessionProjection;
+	const buildProjection = host.buildSessionProjection;
 	if (buildProjection) return buildProjection([...entries]).entries;
 	const lastCompaction = entries.findLastIndex((entry) => entry.type === "compaction");
 	let active = entries;

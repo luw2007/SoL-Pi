@@ -463,7 +463,6 @@ describe("evidence-preserving reducer", () => {
 		},
 	);
 
-<<<<<<< HEAD
 	it("leaves a nested tool call untouched without archiving, journaling, or calling the model", async () => {
 		const root = await storeRoot();
 		let calls = 0;
