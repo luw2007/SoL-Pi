@@ -157,7 +157,7 @@ export async function runFusedMutation<TDetails>({
 		const output = resultText(bashResult);
 		if (isErrorResult(bashResult)) {
 			return {
-				result: appendThenRunText(mutationResult, output ? `${THEN_RUN_FAILED}\n${output}` : THEN_RUN_FAILED, true),
+				result: appendThenRunText(mutationResult, output ? `${THEN_RUN_FAILED}\n${output}` : THEN_RUN_FAILED, true, bashResult),
 				status: "failed",
 			};
 		}
@@ -166,6 +166,7 @@ export async function runFusedMutation<TDetails>({
 				mutationResult,
 				output ? `${THEN_RUN_SUCCEEDED}\n${output}` : THEN_RUN_SUCCEEDED,
 				false,
+				bashResult,
 			),
 			status: "succeeded",
 		};
@@ -180,19 +181,25 @@ function isErrorResult(result: AgentToolResult<unknown>): boolean {
 }
 
 /**
- * Add the follow-up report to the mutation result. Only the mutation's own
- * fields are kept: bash `details` and `structuredContent` describe a different
- * tool and would confuse the edit and write renderers.
+ * Add the follow-up report to the mutation result. The mutation's own fields
+ * are kept so the edit and write renderers still work. When the bash result is
+ * given, its `details` (fullOutputPath/truncation) are merged over the
+ * mutation's details so the evidence reducer can reach the untruncated log;
+ * bash `structuredContent` is not carried over.
  */
 function appendThenRunText<TDetails>(
 	mutationResult: AgentToolResult<TDetails>,
 	text: string,
 	isError: boolean,
+	bashResult?: AgentToolResult<unknown>,
 ): AgentToolResult<TDetails> {
 	const result: MaybeErrorResult<TDetails> = {
 		...mutationResult,
 		content: [...mutationResult.content, { type: "text", text }],
 	};
+	if (bashResult?.details) {
+		result.details = { ...(mutationResult.details as object | undefined), ...(bashResult.details as object) } as TDetails;
+	}
 	if (isError) result.isError = true;
 	return result;
 }
