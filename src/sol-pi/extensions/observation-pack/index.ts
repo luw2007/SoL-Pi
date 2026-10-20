@@ -591,7 +591,8 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 			for (let index = 0; index < projected.length; index += 1) {
 				const message = event.messages[index];
 				const next = projected[index];
-				if (message && next && next !== message) message.content = next.content as typeof message.content;
+				// Only pure-text tool results are ever swapped; narrow both sides of the message union.
+				if (message?.role === "toolResult" && next?.role === "toolResult" && next !== message) message.content = next.content;
 			}
 			return undefined;
 		});

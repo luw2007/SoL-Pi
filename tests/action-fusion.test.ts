@@ -180,7 +180,7 @@ describe("action fusion then_run", () => {
 					invalidate: () => {},
 					lastComponent: undefined,
 					state: {},
-					cwd: process.cwd(),
+					cwd: join(tmpdir(), "plain-checkout"),
 					executionStarted: true,
 					argsComplete: false,
 					isPartial: false,

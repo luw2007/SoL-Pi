@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it } from "vitest";
 import { createOnlineContextCompactExtension } from "../src/sol-pi/extensions/online-context-compact/extension.ts";
-import { FakePi, FakeSessionManager, fakeContext } from "./helpers.ts";
+import { FakePi, FakeSessionManager, fakeContext, toolContextOf } from "./helpers.ts";
 
 const roots: string[] = [];
 const SESSION_ID = "ledger-probe-session";
@@ -111,14 +111,14 @@ describe("online context compact turn_end ledger", () => {
 			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 		await plan.execute!(
 			"plan-done",
 			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 
 		// First turn_end: boundary pending, nothing selected yet -> evaluates.
@@ -186,14 +186,14 @@ describe("online context compact turn_end ledger", () => {
 			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 		await plan.execute!(
 			"plan-done-1",
 			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 
 		// First turn_end: boundary pending, nothing selected yet -> evaluates,
@@ -225,14 +225,14 @@ describe("online context compact turn_end ledger", () => {
 			{ steps: [{ id: "s2", goal: "do more", status: "in_progress" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 		await plan.execute!(
 			"plan-done-2",
 			{ steps: [{ id: "s2", goal: "do more", status: "completed" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 		await pi.emit(
 			"turn_end",
@@ -293,14 +293,14 @@ describe("online context compact turn_end ledger", () => {
 			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 		await plan.execute!(
 			"plan-done",
 			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 
 		// Deliberately NOT awaited yet: a JS function call runs synchronously
@@ -351,14 +351,14 @@ describe("online context compact turn_end ledger", () => {
 			{ steps: [{ id: "s1", goal: "do it", status: "in_progress" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 		await plan.execute!(
 			"plan-done",
 			{ steps: [{ id: "s1", goal: "do it", status: "completed" }] },
 			undefined,
 			() => {},
-			context,
+			toolContextOf(context),
 		);
 
 		await pi.emit(

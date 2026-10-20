@@ -8,7 +8,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { describe, expect, it, vi } from "vitest";
 import { createOnlineContextCompactExtension, POST_COMPACTION_PLAN_REMINDER, SKIPPED_COMPACTION_REMINDER } from "../src/sol-pi/extensions/online-context-compact/extension.ts";
 import { restoreOnlineState } from "../src/sol-pi/extensions/online-context-compact/state.ts";
-import { FakePi, FakeSessionManager, fakeContext } from "./helpers.ts";
+import { FakePi, FakeSessionManager, fakeContext, toolContextOf } from "./helpers.ts";
 
 // Make the extension take its omp path: compaction runs inline from turn_end.
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => ({
@@ -45,9 +45,9 @@ async function scenario(outcome: Outcome) {
 	async function boundary(id: string) {
 		await pi.emit("before_provider_request", {}, ctx);
 		const steps = [{ id, goal: "do work", status: "completed" }, { id: "remaining", goal: "remaining work", status: "pending" }];
-		await pi.tool("update_plan").execute(`${id}-open`, { steps: steps.map((step) => step.id === id ? { ...step, status: "in_progress" } : step) }, undefined, undefined, ctx);
+		await pi.tool("update_plan").execute(`${id}-open`, { steps: steps.map((step) => step.id === id ? { ...step, status: "in_progress" } : step) }, undefined, undefined, toolContextOf(ctx));
 		await pi.emit("before_provider_request", {}, ctx);
-		await pi.tool("update_plan").execute(id, { steps }, undefined, undefined, ctx);
+		await pi.tool("update_plan").execute(id, { steps }, undefined, undefined, toolContextOf(ctx));
 		await pi.emit("turn_end", { message: fauxAssistantMessage("boundary"), toolResults: [{ toolCallId: id, toolName: "update_plan", isError: false }] }, ctx);
 	}
 	return { pi, manager, ctx, abort, compact, boundary };

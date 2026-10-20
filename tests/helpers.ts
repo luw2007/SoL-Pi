@@ -107,7 +107,7 @@ export class FakeSessionManager {
 }
 
 function isSystemMessage(message: AgentMessage): boolean {
-	return (message as { role: string }).role === "system";
+	return (message as { role?: string } | null)?.role === "system";
 }
 
 function sameMessages(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
@@ -222,8 +222,13 @@ export function fakeToolContext(
 	sessionManager: FakeSessionManager | string,
 	overrides: Record<string, unknown> = {},
 ): ToolExecuteContext {
+	return toolContextOf(fakeContext(sessionManager), overrides);
+}
+
+/** Extend an existing {@link fakeContext} with the tool surface Pi adds for tool execution. */
+export function toolContextOf(context: ExtensionContext, overrides: Record<string, unknown> = {}): ToolExecuteContext {
 	return {
-		...(fakeContext(sessionManager) as unknown as Record<string, unknown>),
+		...(context as unknown as Record<string, unknown>),
 		tools: [],
 		executeTool: async (name: string, args: unknown) => ({
 			toolCall: { type: "toolCall", id: "fake/1", name, arguments: args ?? {} },

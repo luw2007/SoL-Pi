@@ -183,10 +183,9 @@ describe("omp host call patterns", () => {
 			// emitContext in FakePi structuredClones (drops symbols), so tag after cloning by calling the handler directly.
 			const handler = h.pi.handlers.get("context")?.[0];
 			h.clock.now = steps * 1_000 + 1_000;
-			const out = (await handler?.({ type: "context", messages: tag(history(steps), steps * 7) }, h.context())) as {
-				messages: AgentMessage[];
-			};
-			for (let step = 1; step <= steps; step += 1) expect(isPlaceholder(out.messages[resultIndex(step)])).toBe(false);
+			const messages = tag(history(steps), steps * 7);
+			await handler?.({ type: "context", messages }, h.context());
+			for (let step = 1; step <= steps; step += 1) expect(isPlaceholder(messages[resultIndex(step)])).toBe(false);
 		}
 		expect((await h.ledger()).filter((row) => row.flushReason)).toEqual([]);
 	});
@@ -374,8 +373,8 @@ describe("fail-open", () => {
 			const messages = history(steps);
 			(messages[0] as unknown as { details: unknown }).details = { big: 10n };
 			h.clock.now = steps * 1_000 + 1_000;
-			const out = (await handler?.({ type: "context", messages }, h.context())) as { messages: AgentMessage[] };
-			expect(out.messages).toHaveLength(messages.length);
+			await handler?.({ type: "context", messages }, h.context());
+			expect(messages).toHaveLength(history(steps).length);
 		}
 		expect(errors.some((error) => error.includes("observation batching"))).toBe(true);
 	});

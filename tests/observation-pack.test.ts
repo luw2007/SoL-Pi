@@ -539,7 +539,7 @@ async function runRealSession(mode: SessionMode, body: string) {
 				return { content: [{ type: "text", text: params.large ? body : "small output" }], details: {} };
 			},
 		});
-		createObservationPackExtension()(pi);
+		createObservationPackExtension({ batchThresholdTokens: 0 })(pi);
 	};
 	const settingsManager = SettingsManager.inMemory({
 		compaction: { enabled: false },

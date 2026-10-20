@@ -204,6 +204,8 @@ async function runCombinedSession(mode: CodemodeMode) {
 			version: 1,
 			actionFusion: true,
 			observationPack: true,
+			// Immediate swap: this test asserts the placeholder at the third full send.
+			observationPackBatchThresholdTokens: 0,
 			evidencePreservingReducer: true,
 			onlineContextCompact: true,
 			evidencePreservingReducerProvider: `sol-pi-cm-reducer-${mode}`,
