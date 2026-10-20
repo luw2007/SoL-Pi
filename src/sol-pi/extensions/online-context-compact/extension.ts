@@ -590,14 +590,6 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 				else if (recoverable) await continueParentTask(context, SKIPPED_COMPACTION_REMINDER);
 				else if (failure) await continueParentTask(context, COMPACTION_FAILED_RESUME_REMINDER);
 				if (failure) throw failure;
-				}
-
-				// The run was stopped for this compaction, so resume it unless the user cancelled.
-				// Known native refusals are recorded as skips; other failures still propagate after resuming.
-				if (compacted) await continueParentTask(context, POST_COMPACTION_PLAN_REMINDER);
-				else if (recoverableError) await continueParentTask(context, SKIPPED_COMPACTION_REMINDER);
-				else if (failure) await continueParentTask(context, COMPACTION_FAILED_RESUME_REMINDER);
-				if (failure && !recoverableError) throw failure;
 			} finally {
 				activeDebt = undefined;
 				releaseParentContinuation(parentContinuation);
