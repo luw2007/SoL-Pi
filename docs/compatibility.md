@@ -13,13 +13,23 @@ SoL-Pi imports only public package exports:
 - `ExtensionContext.model` and `ExtensionContext.modelRegistry`
 - the public session-manager methods exposed through `ExtensionContext`
 
+Host extras that Pi's published typings do not declare — `ctx.invokeTool`, a tool's `approval` declaration, and its `formatApprovalDetails` and `approvalCacheTargets` hooks — are read only after a feature check, through a narrow cast, and are absent on Pi. `ctx.executeTool` is declared by Pi's typings but not exposed by OMP 18.13, and is feature-checked the same way. A host that has these keeps its own behaviour; a host that lacks them runs the public definitions unchanged.
+
 ## Action Fusion
 
 The built-in edit/write definitions capture their working directory, so SoL-Pi caches one definition per `ctx.cwd`. Its own per-file queue surrounds the built-in mutation and follow-up command. It does not nest Pi's built-in mutation queue.
 
-Action Fusion decodes `file://` targets with Node's `fileURLToPath()` before resolving the queue and hash-check path. This keeps file URLs, including percent-encoded filenames and Pi's optional `@` prefix, aligned with the file handled by the built-in mutation tool.
+On a host that offers same-name tool delegation (`ctx.invokeTool`, as OMP does), the mutation runs through that host tool instead of a load-time copy. Plan-mode restrictions, `@register` contents and the active edit schema then apply exactly as they do without SoL-Pi. On a host that also declares an `approval` (OMP), the fused `edit` tool is registered at `session_start` from the live tool schema, so a session setting such as `edit.mode: replace` keeps its parameters; a host without `approval` keeps the load-time schema. The tool description is not re-read: under a model that OMP forces to a different edit mode (DeepSeek and Kimi-class models use `replace`), the description can still describe the configured mode. A mode change later in the session takes effect in a new session. Pi publishes no `ctx.invokeTool`, so it keeps the load-time definition.
 
-The queue covers only fused operations registered by this SoL-Pi instance. External processes, direct built-in-tool calls outside the replacement, and unrelated extensions are not globally locked. SoL-Pi hashes the target immediately before launching `then_run` and skips the command if it observes an intervening content change.
+The same host classifies tool calls through an `approval` declaration. A call carrying `then_run` is therefore classified as command execution, scoped to the host's `bash` approval policy: `tools.approval.bash: deny` rejects the call, and an unset `bash` policy falls back to the mutation tool's own policy. A `deny` from the built-in tool is never relaxed, and a must-prompt signal survives. Two consequences: the host consults one policy per call, so a set `bash` policy replaces a set `edit`/`write` policy for calls that carry `then_run`; and approval is per call, so a `bash: deny` rejects the whole call, mutation included. The host's own approval cache targets pass through untouched, because the host uses them for `tools.restrictedFolders`, and the approval prompt names the command next to the files.
+
+Where the host exposes a nested tool call (`ctx.executeTool`, as Pi's development typings do), the command runs as that `bash` tool, so the host's blocking hooks apply. OMP 18.13 exposes none, so there the command runs through the public bash definition, built on isolated settings: the session's `bash` settings (shell, compound-command handling, direnv, auto-background) and policy keyed on the command text, such as OMP's bash pattern deny list or its interception rules, do not apply to it. Where a command must be blocked, use `tools.approval.bash` rather than a pattern rule.
+
+The fused `edit` and `write` parameters are emitted as plain JSON Schema: the host's own parameter shape plus `then_run`, with optionality carried by `required` alone. A host that publishes its schema through `toJsonSchema()` (OMP) returns plain objects, which must not be wrapped in TypeBox helpers.
+
+Action Fusion decodes `file://` targets with Node's `fileURLToPath()` before resolving the queue and hash-check path. It strips a leading `@` only where Pi does — before `/`, `~`, a Windows absolute path, or a URL — so `@config.json` stays a file named `@config.json`. A target named through a host URL scheme (`local://` and similar) or another user's home (`~alice/x`) is left to the host instead of being read from disk.
+
+The queue covers only fused operations registered by this SoL-Pi instance. External processes, direct built-in-tool calls outside the replacement, and unrelated extensions are not globally locked. Every target of a mutation is locked, in sorted canonical order, so two calls sharing a target cannot interleave or deadlock. SoL-Pi hashes every target immediately before launching `then_run` and skips the command if it observes an intervening content change; a target removed by the mutation must stay absent, and a skipped command still reports the mutation that landed.
 
 ## ObservationPack
 

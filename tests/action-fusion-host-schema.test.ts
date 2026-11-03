@@ -3,13 +3,14 @@
  * SPDX-License-Identifier: MIT
  */
 import { describe, expect, it } from "vitest";
-import { Type, type TSchema } from "typebox";
-import { hostToolProperties } from "../src/sol-pi/extensions/action-fusion/index.ts";
+import { Type } from "typebox";
+import { fusedToolParameters } from "../src/sol-pi/extensions/action-fusion/index.ts";
 
 /**
  * A Pi-compatible host that describes tool parameters with its own schema value:
  * callable rather than a plain object, carrying no `properties`, and exposing the
- * contract only through `toJsonSchema()`.
+ * contract only through `toJsonSchema()`. This is the shape OMP 18.13 publishes,
+ * and its properties are plain JSON, not TypeBox values.
  */
 function hostSchema(json: { properties: Record<string, unknown>; required?: string[] }): unknown {
 	const schema = (value: unknown) => value;
@@ -17,17 +18,19 @@ function hostSchema(json: { properties: Record<string, unknown>; required?: stri
 	return schema;
 }
 
-describe("hostToolProperties", () => {
-	it("returns the TypeBox properties Pi publishes", () => {
+describe("fusedToolParameters", () => {
+	it("keeps the TypeBox properties Pi publishes", () => {
 		const parameters = Type.Object({
 			path: Type.String(),
 			content: Type.String(),
 		});
 
-		expect(Object.keys(hostToolProperties(parameters))).toEqual(["path", "content"]);
+		const fused = fusedToolParameters(parameters, "run next");
+		expect(Object.keys(fused?.properties ?? {})).toEqual(["path", "content", "then_run"]);
+		expect(fused?.required).toEqual(["path", "content"]);
 	});
 
-	it("rebuilds properties from a callable host schema that exposes no properties", () => {
+	it("rebuilds the host's plain JSON properties and their required list", () => {
 		const parameters = hostSchema({
 			properties: {
 				path: { type: "string", description: "file path" },
@@ -36,39 +39,36 @@ describe("hostToolProperties", () => {
 			required: ["path", "content"],
 		});
 
-		const properties = hostToolProperties(parameters);
+		const fused = fusedToolParameters(parameters, "run next");
 
-		expect(Object.keys(properties)).toEqual(["path", "content"]);
-		const fused = Type.Object({ ...properties, then_run: Type.Optional(Type.String()) });
-		expect(fused.required).toEqual(["path", "content"]);
+		expect(fused?.required).toEqual(["path", "content"]);
+		expect(fused?.properties.then_run).toMatchObject({ type: "object", required: ["command"] });
 	});
 
-	it("keeps host-optional parameters optional on the fused tool", () => {
+	it("keeps a host-optional parameter optional, without wrapping it in TypeBox", () => {
+		// OMP's write tool requires `path` and leaves `content` optional, as plain
+		// JSON. `Type.Optional` throws on that value under the TypeBox OMP ships,
+		// so the fused schema must express optionality through `required` alone.
 		const parameters = hostSchema({
-			properties: {
-				path: { type: "string" },
-				encoding: { type: "string" },
-			},
+			properties: { path: { type: "string" }, content: { type: "string" } },
 			required: ["path"],
 		});
 
-		// Unchecked cast: the rebuilt entries are the host's own JSON Schema fragments.
+		const fused = fusedToolParameters(parameters, "run next");
 
-		const properties = hostToolProperties(parameters) as Record<string, TSchema>;
-		const fused = Type.Object(properties);
-
-		expect(fused.required).toEqual(["path"]);
+		expect(fused?.required).toEqual(["path"]);
+		expect(fused?.properties.content).toEqual({ type: "string" });
 	});
 
 	it("preserves optional fields in direct JSON Schema parameters", () => {
-		const properties = hostToolProperties({
+		const fused = fusedToolParameters({
 			properties: { path: { type: "string" }, encoding: { type: "string" } },
 			required: ["path"],
-		}) as Record<string, TSchema>;
-		expect(Type.Object(properties).required).toEqual(["path"]);
+		}, "run next");
+		expect(fused?.required).toEqual(["path"]);
 	});
 
-	it("rejects throwing and malformed host schemas without replacing their tools", () => {
+	it("reports nothing for throwing and malformed host schemas, leaving the tool replaced", () => {
 		const throwsProperties = Object.defineProperty({}, "properties", {
 			get() { throw new Error("unsupported host schema"); },
 		});
@@ -78,14 +78,11 @@ describe("hostToolProperties", () => {
 			{ toJsonSchema() { return null; } },
 			{ toJsonSchema() { return { properties: { path: true } }; } },
 			{ properties: { path: false } },
+			{ type: "object" },
+			undefined,
 		];
 		for (const parameters of cases) {
-			expect(hostToolProperties(parameters)).toEqual({});
+			expect(fusedToolParameters(parameters, "run next")).toBeUndefined();
 		}
-	});
-
-	it("reports no properties when the host exposes neither surface", () => {
-		expect(hostToolProperties({ type: "object" })).toEqual({});
-		expect(hostToolProperties(undefined)).toEqual({});
 	});
 });

@@ -11,6 +11,7 @@ import {
 	type ActionFusionOptions,
 	assertUnchangedBeforeCommand,
 	createActionFusionExtension,
+	mutationTargets,
 } from "../src/sol-pi/extensions/action-fusion/index.ts";
 import { withFusedFileQueue } from "../src/sol-pi/extensions/action-fusion/file-queue.ts";
 import { componentText, plainTheme } from "./helpers.ts";
@@ -418,5 +419,31 @@ describe("action fusion then_run", () => {
 				await writeFile(filePath, "external change\n");
 			}),
 		).rejects.toThrow("[then_run:skipped] target content changed after the fused mutation");
+	});
+});
+
+describe("fused mutation targets", () => {
+	it("reads every path from a patch-string payload instead of a `path` field", () => {
+		const payload = "[src/a.ts#1A2B]\nPUT 2.=2:\n+x\n\n[src/nested/b.py#0F0F]\nCUT 3.=3\n";
+		expect(mutationTargets({ input: payload })).toEqual(["src/a.ts", "src/nested/b.py"]);
+	});
+
+	it("keeps the single `path` argument and rejects a payload with neither shape", () => {
+		expect(mutationTargets({ path: "note.md", content: "x" })).toEqual(["note.md"]);
+		expect(mutationTargets({ input: "PUT 1.=1:\n+x\n" })).toEqual([]);
+	});
+
+	it("skips the command when a second fused target changed", async () => {
+		const dir = await createTempDir();
+		const first = join(dir, "first.txt");
+		const second = join(dir, "second.txt");
+		await writeFile(first, "one\n");
+		await writeFile(second, "two\n");
+
+		await expect(
+			assertUnchangedBeforeCommand([first, second], async () => {
+				await writeFile(second, "changed\n");
+			}),
+		).rejects.toThrow("target content changed after the fused mutation");
 	});
 });
