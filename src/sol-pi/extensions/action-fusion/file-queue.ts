@@ -10,8 +10,28 @@ import { fileURLToPath } from "node:url";
 
 const queueTails = new Map<string, Promise<void>>();
 
+/**
+ * The host strips a leading `@` only when it prefixes a path or a URL (`@/x`,
+ * `@~/x`, `@C:\x`, `@local://x`); `@config.json` is a file whose name starts
+ * with `@`. Strip it the same way, or the queue and the hash guard would watch
+ * a different file than the mutation writes.
+ */
 function stripToolPathPrefix(filePath: string): string {
-	return filePath.startsWith("@") ? filePath.slice(1) : filePath;
+	const prefixed = filePath.startsWith("@") && /^[/~]|[A-Za-z]:[\\/]|[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(filePath.slice(1));
+	return prefixed ? filePath.slice(1) : filePath;
+}
+
+/**
+ * True for a target the host resolves itself instead of the filesystem:
+ * a URL scheme of its own (`local://`, internal URLs) or another user's home
+ * (`~alice/x`, which needs the host's account lookup). `file://` is a
+ * filesystem path resolved here, and `C://` is a Windows path, not a scheme.
+ */
+export function isHostSchemeTarget(filePath: string): boolean {
+	const stripped = stripToolPathPrefix(filePath);
+	if (/^[A-Za-z]:[\\/]/.test(stripped)) return false;
+	if (/^~[^/\\]/.test(stripped)) return true;
+	return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(stripped) && !stripped.startsWith("file://");
 }
 
 export function resolveToolPath(cwd: string, filePath: string): string {
@@ -23,7 +43,7 @@ export function resolveToolPath(cwd: string, filePath: string): string {
 	return resolve(cwd, expanded);
 }
 
-function isMissingPathError(error: unknown): boolean {
+export function isMissingPathError(error: unknown): boolean {
 	return (
 		typeof error === "object" &&
 		error !== null &&
@@ -33,6 +53,8 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 async function canonicalQueueKey(filePath: string): Promise<string> {
+	// A host-scheme target has no filesystem identity; its literal name is the key.
+	if (isHostSchemeTarget(filePath)) return filePath;
 	const resolvedPath = resolve(filePath);
 	let current = resolvedPath;
 	const missingSegments: string[] = [];
@@ -50,12 +72,7 @@ async function canonicalQueueKey(filePath: string): Promise<string> {
 	}
 }
 
-/**
- * Serialize fused operations for one canonical file path. This queue belongs
- * to SoL-Pi and intentionally does not nest Pi's built-in mutation queue.
- */
-export async function withFusedFileQueue<T>(filePath: string, work: () => Promise<T>): Promise<T> {
-	const key = await canonicalQueueKey(filePath);
+async function withQueueKey<T>(key: string, work: () => Promise<T>): Promise<T> {
 	const previous = queueTails.get(key) ?? Promise.resolve();
 	let release!: () => void;
 	const owned = new Promise<void>((resolveOwned) => {
@@ -71,4 +88,26 @@ export async function withFusedFileQueue<T>(filePath: string, work: () => Promis
 		release();
 		if (queueTails.get(key) === tail) queueTails.delete(key);
 	}
+}
+
+/**
+ * Serialize fused operations for one canonical file path. This queue belongs
+ * to SoL-Pi and intentionally does not nest Pi's built-in mutation queue.
+ */
+export async function withFusedFileQueue<T>(filePath: string, work: () => Promise<T>): Promise<T> {
+	return withQueueKey(await canonicalQueueKey(filePath), work);
+}
+
+/**
+ * Serialize fused operations over every path a mutation touches. Keys are
+ * acquired one at a time in sorted order, so two calls sharing any targets
+ * always take them in the same order and cannot deadlock.
+ */
+export async function withFusedFileQueues<T>(filePaths: readonly string[], work: () => Promise<T>): Promise<T> {
+	const keys = [...new Set(await Promise.all(filePaths.map(canonicalQueueKey)))].sort();
+	const acquire = (index: number): Promise<T> => {
+		const key = keys[index];
+		return key === undefined ? work() : withQueueKey(key, () => acquire(index + 1));
+	};
+	return acquire(0);
 }

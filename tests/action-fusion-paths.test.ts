@@ -53,7 +53,10 @@ describe("Action Fusion file URL paths", () => {
 		const cwd = join(tmpdir(), "action-fusion-cwd");
 		const target = join(cwd, "target.txt");
 		expect(resolveToolPath(cwd, "target.txt")).toBe(target);
-		expect(resolveToolPath(cwd, "@target.txt")).toBe(target);
+		// The host strips `@` only before a path or URL (`@/x`, `@~/x`, `@C:\x`), so
+		// `@target.txt` is a file whose name starts with `@`.
+		expect(resolveToolPath(cwd, "@target.txt")).toBe(join(cwd, "@target.txt"));
+		expect(resolveToolPath(cwd, "@/target.txt")).toBe(resolve("/target.txt"));
 		expect(resolveToolPath(cwd, target)).toBe(target);
 	});
 
