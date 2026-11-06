@@ -11,7 +11,9 @@ export function loadActionFusionBashOptions(
 	agentDir: string = getAgentDir(),
 ): BashToolOptions {
 	const settings = SettingsManager.create(cwd, agentDir, { projectTrusted });
-	const errors = settings.drainErrors();
+	// omp's legacy Pi shim exposes SettingsManager without drainErrors.
+	const errors =
+		"drainErrors" in settings && typeof settings.drainErrors === "function" ? settings.drainErrors() : [];
 	if (errors.length > 0) {
 		throw new Error(`Action Fusion could not load Pi shell settings: ${errors.map(({ error }) => error.message).join("; ")}`);
 	}
