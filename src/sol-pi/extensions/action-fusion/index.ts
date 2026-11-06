@@ -28,7 +28,7 @@ import {
 	type ExtensionFactory,
 	type WriteToolOptions,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 import { resolveToolPath } from "./file-queue.ts";
 import { isNestedToolCallId, renderSolPiTool, showSolPiSavings } from "../../tui.ts";
 import { createThenRunSchema, runFusedMutation, type ThenRunInput, type ThenRunStatus } from "./then-run.ts";
@@ -73,6 +73,11 @@ function announceSavings(status: ThenRunStatus, toolCallId: string, ctx: Extensi
 	showSolPiSavings(ctx, "Action Fusion", "1 model round-trip avoided");
 }
 
+/** The fused argument a renderer receives, when the host typed it as a bare schema. */
+function passedThenRun(args: unknown): unknown {
+	return typeof args === "object" && args !== null && "then_run" in args ? args.then_run : undefined;
+}
+
 /**
  * Show the savings banner on a fused call unless it settled as an error: a
  * failed or skipped command avoided no round-trip. Pi redraws the call row
@@ -114,6 +119,69 @@ export function hostToolProperties(parameters: unknown): Record<string, unknown>
 	);
 }
 
+/**
+ * The host's declared contract when it publishes parameters as a callable schema
+ * without readable `properties` (omp's Pi shim, for example).
+ */
+function hostJsonContract(
+	parameters: unknown,
+): { readonly properties: Record<string, unknown>; readonly required: readonly string[] } | undefined {
+	if (!parameters || (typeof parameters !== "object" && typeof parameters !== "function")) return undefined;
+	const readable = "properties" in parameters ? parameters.properties : undefined;
+	if (readable && typeof readable === "object" && Object.keys(readable).length > 0) return undefined;
+	if (!("toJsonSchema" in parameters) || typeof parameters.toJsonSchema !== "function") return undefined;
+	// Unchecked cast: the function is the host's own JSON Schema exporter.
+	const json = parameters.toJsonSchema() as {
+		properties?: Record<string, unknown>;
+		required?: readonly string[];
+	};
+	const properties = json.properties ?? {};
+	if (Object.keys(properties).length === 0) return undefined;
+	return { properties, required: json.required ?? [] };
+}
+
+/** The host's declared parameter names, read without materializing a schema. */
+function hostParameterNames(parameters: unknown): ReadonlySet<string> {
+	const contract = hostJsonContract(parameters);
+	if (contract) return new Set(Object.keys(contract.properties));
+	const readable =
+		parameters && typeof parameters === "object" && "properties" in parameters ? parameters.properties : undefined;
+	return new Set(readable && typeof readable === "object" ? Object.keys(readable) : []);
+}
+
+function thenRunJsonSchema(description: string): Record<string, unknown> {
+	return {
+		type: "object",
+		properties: {
+			command: { type: "string", description: "Bash command to run" },
+			timeout: { type: "number", description: "Timeout in seconds (optional, no default timeout)" },
+		},
+		required: ["command"],
+	};
+}
+
+/**
+ * Fuse `then_run` into the host's own parameter contract. A reduced host that
+ * only exports JSON Schema keeps that shape: its converter rejects a TypeBox
+ * `Type.Optional` wrapped around a plain schema fragment.
+ */
+function fusedToolParameters(parameters: unknown, description: string): TSchema {
+	const contract = hostJsonContract(parameters);
+	if (contract) {
+		// Unchecked cast: the host consumes its own JSON Schema shape, which TypeBox
+		// cannot express; the fields follow the built-in tool's declared contract.
+		return {
+			type: "object",
+			properties: { ...contract.properties, then_run: thenRunJsonSchema(description) },
+			required: contract.required,
+		} as unknown as TSchema;
+	}
+	return Type.Object({
+		...hostToolProperties(parameters),
+		then_run: createThenRunSchema(description),
+	});
+}
+
 export function createActionFusionExtension(options: ActionFusionOptions = {}): ExtensionFactory {
 	const baseEdit = memoizeByCwd((cwd: string) => createEditToolDefinition(cwd, options.editOptions));
 	const baseWrite = memoizeByCwd((cwd: string) => createWriteToolDefinition(cwd, options.writeOptions));
@@ -122,31 +190,22 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 		const editTemplate = baseEdit(process.cwd());
 		const writeTemplate = baseWrite(process.cwd());
 
-		// Unchecked cast: on a TypeBox host these are exactly the built-in tool's
-		// own properties; on a reduced host they are rebuilt from the same schema,
-		// so the fused tool keeps the built-in argument contract either way.
-		const editProperties = hostToolProperties(
-			editTemplate.parameters,
-		) as typeof editTemplate.parameters.properties;
-		const writeProperties = hostToolProperties(
-			writeTemplate.parameters,
-		) as typeof writeTemplate.parameters.properties;
+		// The host's declared parameter names, without materializing a TypeBox
+		// schema: a reduced host rejects `Type.Optional` over its JSON fragments.
+		const editDeclaresPath = hostParameterNames(editTemplate.parameters).has("path");
+		const writeDeclaresPath = hostParameterNames(writeTemplate.parameters).has("path");
 
-		const editParameters = Type.Object({
-			...editProperties,
-			then_run: createThenRunSchema(EDIT_THEN_RUN_DESCRIPTION),
-		});
-		const writeParameters = Type.Object({
-			...writeProperties,
-			then_run: createThenRunSchema(WRITE_THEN_RUN_DESCRIPTION),
-		});
+		// Unchecked cast: fused parameters keep the host's own declared shape; the
+		// builder only appends the optional `then_run` field.
+		const editParameters = fusedToolParameters(editTemplate.parameters, EDIT_THEN_RUN_DESCRIPTION) as typeof editTemplate.parameters;
+		const writeParameters = fusedToolParameters(writeTemplate.parameters, WRITE_THEN_RUN_DESCRIPTION) as typeof writeTemplate.parameters;
 
 		// The fused queue and the pre-command hash check are keyed on one target
 		// file, so only replace a mutation tool that names its target with `path`.
 		// A host whose edit tool takes a different shape (a multi-file patch, say)
 		// keeps its built-in tool rather than getting a fused one that cannot
 		// resolve a target.
-		if ("path" in editProperties) {
+		if (editDeclaresPath) {
 			pi.registerTool<typeof editParameters, EditToolDetails | undefined>({
 				...editTemplate,
 				parameters: editParameters,
@@ -166,20 +225,20 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 				},
 				renderCall: (args, theme, context) => {
 					const base = baseEdit(context.cwd).renderCall!(args, theme, context);
-					return showsSavingsBanner(args.then_run, context)
+					return showsSavingsBanner(passedThenRun(args), context)
 						? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
 						: base;
 				},
 				renderResult: (result, resultOptions, theme, context) => {
 					const base = baseEdit(context.cwd).renderResult!(result, resultOptions, theme, context);
-					return showsSavingsBanner(context.args.then_run, context)
+					return showsSavingsBanner(passedThenRun(context.args), context)
 						? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
 						: base;
 				},
 			});
 		}
 
-		if (!("path" in writeProperties)) return;
+		if (!writeDeclaresPath) return;
 
 		pi.registerTool<typeof writeParameters, undefined>({
 			...writeTemplate,
@@ -200,13 +259,13 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 			},
 			renderCall: (args, theme, context) => {
 				const base = baseWrite(context.cwd).renderCall!(args, theme, context);
-				return showsSavingsBanner(args.then_run, context)
+				return showsSavingsBanner(passedThenRun(args), context)
 					? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
 					: base;
 			},
 			renderResult: (result, resultOptions, theme, context) => {
 				const base = baseWrite(context.cwd).renderResult!(result, resultOptions, theme, context);
-				return showsSavingsBanner(context.args.then_run, context)
+				return showsSavingsBanner(passedThenRun(context.args), context)
 					? renderSolPiTool(theme, "Action Fusion", "1 model round-trip avoided", base)
 					: base;
 			},
