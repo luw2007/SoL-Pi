@@ -43,6 +43,8 @@ Only Online Context Compact handles `before_provider_request`, to count requests
 
 SoL-Pi caches one built-in edit/write definition per `ctx.cwd`. Pi 0.84.2's definitions resolve paths against the directory they were created with; Pi 1.x resolves them against `ctx.cwd` at execution, so both agree. Its own per-file queue surrounds the built-in mutation and follow-up command. It does not nest Pi's built-in mutation queue.
 
+On omp 18.16.0, Action Fusion delegates mutations through the public `ctx.invokeTool()` when available, keeping the native tool bound to the active session. This preserves staged-action resolution through `write` to `xd://resolve` and `xd://reject`, along with native result metadata. Hosts without this API continue to use Pi's public edit/write factories. Host-owned URI writes such as `xd://` and `local://` delegate directly without a local-file queue or hash check. `then_run` requires a local file target; combining it with an internal URI is rejected before the native write or command executes.
+
 Action Fusion decodes `file://` targets with Node's `fileURLToPath()` before resolving the queue and hash-check path. This keeps file URLs, including percent-encoded filenames and Pi's optional `@` prefix, aligned with the file handled by the built-in mutation tool.
 
 On Windows it applies the same drive-path conversion Pi's own resolver applies, so Git Bash, MSYS, Cygwin, and WSL targets such as `/c/src/app.ts` and home-relative `~\` paths resolve to the file the built-in mutation tool wrote. On other platforms those inputs keep their POSIX meaning.

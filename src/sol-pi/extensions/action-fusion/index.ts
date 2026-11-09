@@ -17,6 +17,7 @@
  * This standalone version composes only Pi's public tool definitions.
  */
 
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
 	type BashToolOptions,
 	createEditToolDefinition,
@@ -27,6 +28,7 @@ import {
 	type ExtensionContext,
 	type ExtensionFactory,
 	type WriteToolOptions,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { resolveToolPath } from "./file-queue.ts";
@@ -46,6 +48,11 @@ export interface ActionFusionOptions {
 	/** Overrides for the underlying built-in `write` tool. */
 	readonly writeOptions?: WriteToolOptions;
 }
+
+/** Hosts with native delegation keep mutations bound to the active session. */
+type NativeToolContext = Parameters<ToolDefinition["execute"]>[4] & {
+	invokeTool?<TDetails>(input: Record<string, unknown>): Promise<AgentToolResult<TDetails>>;
+};
 
 /**
  * Built-in tool definitions capture their cwd in closures, so keep one per
@@ -211,6 +218,7 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 				parameters: editParameters,
 				async execute(toolCallId, input, signal, onUpdate, ctx) {
 					const { then_run, ...editInput } = input as typeof input & { then_run?: ThenRunInput };
+					const nativeContext = ctx as NativeToolContext;
 					const { result, status } = await runFusedMutation({
 						toolCallId,
 						absolutePath: resolveToolPath(ctx.cwd, input.path),
@@ -218,7 +226,9 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 						bashOptions: options.bashOptions,
 						signal,
 						ctx,
-						mutate: () => baseEdit(ctx.cwd).execute(toolCallId, editInput, signal, onUpdate, ctx),
+						mutate: () => nativeContext.invokeTool
+							? nativeContext.invokeTool<EditToolDetails | undefined>(editInput)
+							: baseEdit(ctx.cwd).execute(toolCallId, editInput, signal, onUpdate, ctx),
 					});
 					announceSavings(status, toolCallId, ctx);
 					return result;
@@ -245,6 +255,18 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 			parameters: writeParameters,
 			async execute(toolCallId, input, signal, onUpdate, ctx) {
 				const { then_run, ...writeInput } = input as typeof input & { then_run?: ThenRunInput };
+				const nativeContext = ctx as NativeToolContext;
+				const mutate = () => nativeContext.invokeTool
+					? nativeContext.invokeTool<undefined>(writeInput)
+					: baseWrite(ctx.cwd).execute(toolCallId, writeInput, signal, onUpdate, ctx);
+				// Internal URLs are host-owned resources, not local queue/hash targets.
+				const isInternalUrl = /^\[?@?(?!file:\/\/)[a-z][a-z\d+.-]*:\/\//iu.test(input.path);
+				if (isInternalUrl) {
+					if (then_run !== undefined) {
+						throw new Error("then_run requires a local file target; write internal URLs without then_run.");
+					}
+					return mutate();
+				}
 				const { result, status } = await runFusedMutation({
 					toolCallId,
 					absolutePath: resolveToolPath(ctx.cwd, input.path),
@@ -252,7 +274,7 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 					bashOptions: options.bashOptions,
 					signal,
 					ctx,
-					mutate: () => baseWrite(ctx.cwd).execute(toolCallId, writeInput, signal, onUpdate, ctx),
+					mutate,
 				});
 				announceSavings(status, toolCallId, ctx);
 				return result;
