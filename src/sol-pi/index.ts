@@ -19,6 +19,7 @@ export function registerConfiguredFeatures(
 	if (config.actionFusion) createActionFusionExtension({ bashOptions })(pi);
 	if (config.observationPack) {
 		registerObservationPack(pi, {
+			thresholdBytes: config.observationPackThresholdBytes,
 			batchThresholdTokens: config.observationPackBatchThresholdTokens,
 			coldGapMs: config.observationPackColdGapMs,
 			prefixDiagnostics: config.observationPackPrefixDiagnostics,

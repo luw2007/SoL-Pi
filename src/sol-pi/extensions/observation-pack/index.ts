@@ -62,6 +62,7 @@ import {
 	placeholderFor,
 	type RecallChunk,
 	readRecallChunk,
+	THRESHOLD_BYTES,
 } from "./observation.ts";
 
 const RECALL_MAX_BYTES = 16 * 1024;
@@ -78,6 +79,8 @@ const RECALL_LIMITS = {
 const LOGGED_KEYS_MAX = 100_000;
 
 export interface ObservationPackOptions {
+	/** Only pure-text results larger than this many bytes are packed. */
+	readonly thresholdBytes?: number;
 	/** Σ removable pending tokens that triggers a batch swap; `0` keeps the legacy immediate swap. */
 	readonly batchThresholdTokens?: number;
 	/** Idle gap since the last assistant message (or a later host cache-warming refresh) after which pending observations swap. */
@@ -127,6 +130,7 @@ function failOpen(error: unknown, scope: string): void {
 }
 
 export function createObservationPackExtension(options: ObservationPackOptions = {}): ExtensionFactory {
+	const thresholdBytes = options.thresholdBytes ?? THRESHOLD_BYTES;
 	const batchThresholdTokens = options.batchThresholdTokens ?? DEFAULT_BATCH_THRESHOLD_TOKENS;
 	const coldGapMs = options.coldGapMs ?? DEFAULT_COLD_GAP_MS;
 	const prefixDiagnostics = options.prefixDiagnostics ?? false;
@@ -310,7 +314,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 				if (!message || !isPureTextResult(message)) continue;
 
 				try {
-					const observation = createObservation(message, root);
+					const observation = createObservation(message, root, thresholdBytes);
 					if (!observation) continue;
 					await ensureStored(observation);
 
@@ -401,7 +405,7 @@ export function createObservationPackExtension(options: ObservationPackOptions =
 				const message = messages[index];
 				try {
 					if (!message || !isPureTextResult(message)) continue;
-					const observation = createObservation(message, root);
+					const observation = createObservation(message, root, thresholdBytes);
 					if (!observation) continue;
 					await ensureStored(observation);
 					const previousSends = priorAssistantCounts[index] ?? 0;

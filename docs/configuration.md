@@ -26,12 +26,13 @@ The project file replaces the global file. SoL-Pi does not merge them.
   "cacheWriteReadRatio": 12.5,
   "keepRecentTokens": 20000,
   "observationPackBatchThresholdTokens": 20000,
+  "observationPackThresholdBytes": 10240,
   "observationPackColdGapMs": 300000,
   "observationPackPrefixDiagnostics": false
 }
 ```
 
-Feature keys may be omitted and then default to `false`. `cacheWriteReadRatio` may be omitted and then defaults to `12.5`; when present it must be a finite non-negative number, and `0` explicitly means that a cache write adds no cost relative to a cache read. `keepRecentTokens` may be omitted and then defaults to `20000`; when present it must be a positive safe integer and controls the retained tail budget used by Online Context Compact feasibility checks. `observationPackBatchThresholdTokens` may be omitted and then defaults to `20000`; when present it must be a non-negative safe integer, and `0` restores the legacy one-by-one placeholder swap. `observationPackColdGapMs` may be omitted and then defaults to `300000`; when present it must be a positive safe integer. `observationPackPrefixDiagnostics` may be omitted and then defaults to `false`; when present it must be boolean. `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` may be omitted and then use the built-in reducer route; when present each must be a non-empty string. Unknown keys, unsupported versions, malformed JSON, non-boolean feature values, invalid ratios, invalid keep-recent budgets, invalid ObservationPack batching values, and invalid reducer model fields stop extension loading with a direct error.
+Feature keys may be omitted and then default to `false`. `cacheWriteReadRatio` may be omitted and then defaults to `12.5`; when present it must be a finite non-negative number, and `0` explicitly means that a cache write adds no cost relative to a cache read. `keepRecentTokens` may be omitted and then defaults to `20000`; when present it must be a positive safe integer and controls the retained tail budget used by Online Context Compact feasibility checks. `observationPackBatchThresholdTokens` may be omitted and then defaults to `20000`; when present it must be a non-negative safe integer, and `0` restores the legacy one-by-one placeholder swap. `observationPackThresholdBytes` may be omitted and then defaults to `10240`; when present it must be a positive safe integer, and only successful pure-text tool results whose UTF-8 byte length is strictly greater than this threshold are eligible for ObservationPack. `observationPackColdGapMs` may be omitted and then defaults to `300000`; when present it must be a positive safe integer. `observationPackPrefixDiagnostics` may be omitted and then defaults to `false`; when present it must be boolean. `evidencePreservingReducerProvider` and `evidencePreservingReducerModel` may be omitted and then use the built-in reducer route; when present each must be a non-empty string. Unknown keys, unsupported versions, malformed JSON, non-boolean feature values, invalid ratios, invalid keep-recent budgets, invalid ObservationPack batching values, and invalid reducer model fields stop extension loading with a direct error.
 
 For the managed all-enabled installation described in the [agent installation and configuration protocol](../agents-install.md), validate the effective file before starting Pi:
 
@@ -47,7 +48,7 @@ This preflight does not make every valid SoL-Pi configuration all-enabled. Witho
 
 - `actionFusion`: registers SoL-Pi replacements for Pi's `edit` and `write` tools.
 - `observationPack`: registers `obs_recall` and a provider-context projection handler.
-- `observationPackBatchThresholdTokens`, `observationPackColdGapMs`, `observationPackPrefixDiagnostics`: tune when ObservationPack swaps pending results for placeholders; see [ObservationPack batching](#observationpack-batching).
+- `observationPackBatchThresholdTokens`, `observationPackThresholdBytes`, `observationPackColdGapMs`, `observationPackPrefixDiagnostics`: tune when ObservationPack swaps pending results for placeholders and which results are eligible; see [ObservationPack batching](#observationpack-batching).
 - `evidencePreservingReducer`: registers a `tool_result` handler and delegates long diagnostic-log reduction to the configured reducer provider/model.
 - `evidencePreservingReducerProvider`: provider namespace used to resolve the reducer model through Pi's model registry.
 - `evidencePreservingReducerModel`: model id used for Evidence-Preserving Reducer.

@@ -14,6 +14,7 @@ import {
 	DEFAULT_BATCH_THRESHOLD_TOKENS,
 	DEFAULT_COLD_GAP_MS,
 } from "./extensions/observation-pack/batching.ts";
+import { THRESHOLD_BYTES } from "./extensions/observation-pack/observation.ts";
 
 export const DEFAULT_CACHE_WRITE_READ_RATIO = 12.5;
 
@@ -30,6 +31,8 @@ export interface SolPiConfig {
 	readonly keepRecentTokens?: number;
 	/** ObservationPack batch swap threshold in removable tokens; 0 = legacy immediate swap. */
 	readonly observationPackBatchThresholdTokens: number;
+	/** Only pure-text tool results larger than this many bytes are packed. */
+	readonly observationPackThresholdBytes: number;
 	/** ObservationPack idle gap after which pending observations swap. */
 	readonly observationPackColdGapMs: number;
 	/** Append ObservationPack prefix/flush diagnostics per provider request. */
@@ -46,6 +49,7 @@ export const DEFAULT_CONFIG: SolPiConfig = Object.freeze({
 	onlineContextCompact: false,
 	cacheWriteReadRatio: DEFAULT_CACHE_WRITE_READ_RATIO,
 	observationPackBatchThresholdTokens: DEFAULT_BATCH_THRESHOLD_TOKENS,
+	observationPackThresholdBytes: THRESHOLD_BYTES,
 	observationPackColdGapMs: DEFAULT_COLD_GAP_MS,
 	observationPackPrefixDiagnostics: false,
 });
@@ -64,6 +68,7 @@ const CONFIG_KEYS = new Set<string>([
 	"cacheWriteReadRatio",
 	"keepRecentTokens",
 	"observationPackBatchThresholdTokens",
+	"observationPackThresholdBytes",
 	"observationPackColdGapMs",
 	"observationPackPrefixDiagnostics",
 ]);
@@ -138,6 +143,15 @@ export function loadSolPiConfig(
 			observationPackBatchThresholdTokens < 0)
 	) {
 		throw new Error(`SoL-Pi config observationPackBatchThresholdTokens must be a non-negative integer: ${path}`);
+	}
+	const observationPackThresholdBytes = record.observationPackThresholdBytes;
+	if (
+		observationPackThresholdBytes !== undefined &&
+		(typeof observationPackThresholdBytes !== "number" ||
+			!Number.isSafeInteger(observationPackThresholdBytes) ||
+			observationPackThresholdBytes <= 0)
+	) {
+		throw new Error(`SoL-Pi config observationPackThresholdBytes must be a positive integer: ${path}`);
 	}
 	const observationPackColdGapMs = record.observationPackColdGapMs;
 	if (

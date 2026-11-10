@@ -15,6 +15,7 @@ const FEATURE_KEYS = [
 const DEFAULT_CACHE_WRITE_READ_RATIO = 12.5;
 const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
 const DEFAULT_OBSERVATION_PACK_BATCH_THRESHOLD_TOKENS = 20_000;
+const DEFAULT_OBSERVATION_PACK_THRESHOLD_BYTES = 10_240;
 const DEFAULT_OBSERVATION_PACK_COLD_GAP_MS = 300_000;
 const DEFAULT_EPR_REDUCER_PROVIDER = ["openai", "codex"].join("-");
 const DEFAULT_EPR_REDUCER_MODEL = ["gpt-5.6", "luna"].join("-");
@@ -26,6 +27,7 @@ const CONFIG_KEYS = new Set([
 	"cacheWriteReadRatio",
 	"keepRecentTokens",
 	"observationPackBatchThresholdTokens",
+	"observationPackThresholdBytes",
 	"observationPackColdGapMs",
 	"observationPackPrefixDiagnostics",
 ]);
@@ -111,6 +113,13 @@ function validateConfig(value, requireAllEnabled) {
 		fail("observationPackBatchThresholdTokens must be a non-negative safe integer");
 	}
 	effective.observationPackBatchThresholdTokens = observationPackBatchThresholdTokens;
+	const observationPackThresholdBytes = Object.hasOwn(value, "observationPackThresholdBytes")
+		? value.observationPackThresholdBytes
+		: DEFAULT_OBSERVATION_PACK_THRESHOLD_BYTES;
+	if (!Number.isSafeInteger(observationPackThresholdBytes) || observationPackThresholdBytes < 1) {
+		fail("observationPackThresholdBytes must be a positive safe integer");
+	}
+	effective.observationPackThresholdBytes = observationPackThresholdBytes;
 	const observationPackColdGapMs = Object.hasOwn(value, "observationPackColdGapMs")
 		? value.observationPackColdGapMs
 		: DEFAULT_OBSERVATION_PACK_COLD_GAP_MS;

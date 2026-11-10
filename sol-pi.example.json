@@ -9,6 +9,7 @@
 	"cacheWriteReadRatio": 12.5,
 	"keepRecentTokens": 20000,
 	"observationPackBatchThresholdTokens": 20000,
+	"observationPackThresholdBytes": 10240,
 	"observationPackColdGapMs": 300000,
 	"observationPackPrefixDiagnostics": false
 }
