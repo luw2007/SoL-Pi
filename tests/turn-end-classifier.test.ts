@@ -27,6 +27,12 @@ describe("classifyTurnEnd — every bucket, in the same left-to-right order the 
 		readonly decisionEvaluated: boolean;
 	}> = [
 		{ name: "no pending boundary", patch: { hasPendingBoundary: false }, bucket: "no_boundary", decisionEvaluated: false },
+		{
+			name: "boundary-less protection candidate",
+			patch: { hasPendingBoundary: false, hasProtectionCandidate: true },
+			bucket: "protection_candidate",
+			decisionEvaluated: true,
+		},
 		{ name: "already selected", patch: { hasAlreadySelected: true }, bucket: "already_selected", decisionEvaluated: false },
 		{ name: "turn message is not assistant", patch: { messageRole: "user" }, bucket: "turn_not_assistant", decisionEvaluated: false },
 		{ name: "turn stopped on error", patch: { stopReason: "error" }, bucket: "turn_error", decisionEvaluated: false },
@@ -64,6 +70,16 @@ describe("classifyTurnEnd — precedence when multiple conditions overlap", () =
 			toolResultIsError: true,
 		});
 		expect(result.bucket).toBe("no_boundary");
+	});
+
+	it("already_selected wins over a protection candidate", () => {
+		const result = classifyTurnEnd({
+			...BASE,
+			hasPendingBoundary: false,
+			hasProtectionCandidate: true,
+			hasAlreadySelected: true,
+		});
+		expect(result.bucket).toBe("already_selected");
 	});
 
 	it("already_selected wins over turn_not_assistant when both hold", () => {

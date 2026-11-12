@@ -68,6 +68,18 @@ describe("Online Context Compact economics", () => {
 		).toMatchObject({ compact: true, reason: "budget_protection" });
 	});
 
+	it("uses configured budget protection during cooldown", () => {
+		expect(
+			decision({
+				completedBoundaryRequestCounts: null,
+				remainingBoundaries: 0,
+				onlineContextMaxTokens: 75_000,
+				priorCompactionCount: 1,
+				requestsSinceLastCompaction: 1,
+			}),
+		).toMatchObject({ compact: true, reason: "budget_protection" });
+	});
+
 	it("uses window protection even when the ordinary economic gate defers", () => {
 		expect(
 			decision({

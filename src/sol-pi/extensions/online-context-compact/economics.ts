@@ -212,7 +212,8 @@ export function decideCompaction(input: {
 		input.requestsSinceLastCompaction !== null &&
 		input.requestsSinceLastCompaction !== undefined &&
 		input.requestsSinceLastCompaction < input.economics.minimumRequestsSinceCompaction;
-	// Window protection stays absolute: near the context limit, compact even in cooldown.
+	// Safety protection stays absolute: near the context limit or an explicit
+	// opt-in budget, compact even in cooldown. Economic compaction still respects it.
 	const economicAllowed = economic && !cooldownActive;
 	const compact = compressible && (windowProtection || budgetProtection || economicAllowed);
 

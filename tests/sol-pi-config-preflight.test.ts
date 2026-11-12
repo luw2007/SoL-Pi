@@ -79,6 +79,18 @@ describe("SoL-Pi configuration preflight", () => {
 		expect(result.stderr).toContain("keepRecentTokens must be a positive safe integer");
 	});
 
+	it("accepts an explicit online context soft budget", () => {
+		const result = run(writeConfig({ ...ALL_ENABLED, onlineContextMaxTokens: 150_000 }));
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout).effective_config.onlineContextMaxTokens).toBe(150_000);
+	});
+
+	it.each([0, -1, 1.5, "150000", null])("rejects invalid onlineContextMaxTokens: %j", (onlineContextMaxTokens) => {
+		const result = run(writeConfig({ ...ALL_ENABLED, onlineContextMaxTokens }));
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("onlineContextMaxTokens must be a positive safe integer");
+	});
+
 	it("applies default ObservationPack batching values when omitted", () => {
 		const result = run(writeConfig(ALL_ENABLED));
 		expect(result.status).toBe(0);
