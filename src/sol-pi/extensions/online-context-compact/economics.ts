@@ -25,6 +25,7 @@ export const DEFAULT_COMPACTION_ECONOMICS: CompactionEconomics = Object.freeze({
 export type CompactionReason =
 	| "economic"
 	| "window_protection"
+	| "budget_protection"
 	| "deferred_economic"
 	| "deferred_subsequent_margin"
 	| "deferred_carried_debt"
@@ -131,6 +132,8 @@ export function decideCompaction(input: {
 	readonly archiveTokens: number;
 	readonly memoTokens: number;
 	readonly contextTokens: number;
+	/** Optional configured soft budget; protective compaction is eligible at or above it. */
+	readonly onlineContextMaxTokens?: number;
 	readonly completedBoundaryRequestCounts: readonly number[] | null;
 	readonly remainingBoundaries: number;
 	readonly averageContextTokenIncrement: number | null;
@@ -180,6 +183,8 @@ export function decideCompaction(input: {
 	const windowProtection =
 		input.contextWindowTokens !== null &&
 		input.contextTokens >= input.contextWindowTokens - input.economics.windowReserveTokens;
+	const budgetProtection =
+		input.onlineContextMaxTokens !== undefined && input.contextTokens >= input.onlineContextMaxTokens;
 	const baseEconomic =
 		horizon !== null &&
 		horizon.expectedRemainingRequests > 0 &&
@@ -209,7 +214,7 @@ export function decideCompaction(input: {
 		input.requestsSinceLastCompaction < input.economics.minimumRequestsSinceCompaction;
 	// Window protection stays absolute: near the context limit, compact even in cooldown.
 	const economicAllowed = economic && !cooldownActive;
-	const compact = compressible && (windowProtection || economicAllowed);
+	const compact = compressible && (windowProtection || budgetProtection || economicAllowed);
 
 	return {
 		writeTokens: input.writeTokens,
@@ -240,6 +245,8 @@ export function decideCompaction(input: {
 			? "non_positive_saving"
 			: windowProtection
 				? "window_protection"
+				: budgetProtection
+					? "budget_protection"
 				: economic && cooldownActive
 					? "deferred_post_compaction_cooldown"
 					: economic

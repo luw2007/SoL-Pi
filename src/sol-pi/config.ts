@@ -29,6 +29,8 @@ export interface SolPiConfig {
 	readonly cacheWriteReadRatio: number;
 	/** Host keep-recent budget for boundary compaction feasibility; undefined = extension default. */
 	readonly keepRecentTokens?: number;
+	/** Optional provider-visible context budget for protective compaction; undefined disables budget triggering. */
+	readonly onlineContextMaxTokens?: number;
 	/** ObservationPack batch swap threshold in removable tokens; 0 = legacy immediate swap. */
 	readonly observationPackBatchThresholdTokens: number;
 	/** Only pure-text tool results larger than this many bytes are packed. */
@@ -67,6 +69,7 @@ const CONFIG_KEYS = new Set<string>([
 	...STRING_KEYS,
 	"cacheWriteReadRatio",
 	"keepRecentTokens",
+	"onlineContextMaxTokens",
 	"observationPackBatchThresholdTokens",
 	"observationPackThresholdBytes",
 	"observationPackColdGapMs",
@@ -134,6 +137,15 @@ export function loadSolPiConfig(
 		(typeof keepRecentTokens !== "number" || !Number.isSafeInteger(keepRecentTokens) || keepRecentTokens <= 0)
 	) {
 		throw new Error(`SoL-Pi config keepRecentTokens must be a positive integer: ${path}`);
+	}
+	const onlineContextMaxTokens = record.onlineContextMaxTokens;
+	if (
+		onlineContextMaxTokens !== undefined &&
+		(typeof onlineContextMaxTokens !== "number" ||
+			!Number.isSafeInteger(onlineContextMaxTokens) ||
+			onlineContextMaxTokens <= 0)
+	) {
+		throw new Error(`SoL-Pi config onlineContextMaxTokens must be a positive safe integer: ${path}`);
 	}
 	const observationPackBatchThresholdTokens = record.observationPackBatchThresholdTokens;
 	if (

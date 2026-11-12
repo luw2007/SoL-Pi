@@ -163,6 +163,22 @@ describe("SoL-Pi config", () => {
 		);
 	});
 
+	it("loads an optional online context protection budget", () => {
+		const { cwd, agentDir } = fixture();
+		const path = join(agentDir, "sol-pi.json");
+		writeFileSync(path, JSON.stringify({ version: 1, onlineContextMaxTokens: 150_000 }));
+		expect(loadSolPiConfig(cwd, agentDir, true).onlineContextMaxTokens).toBe(150_000);
+	});
+
+	it.each([0, -1, "150000"])('rejects an invalid online context protection budget: %j', (onlineContextMaxTokens) => {
+		const { cwd, agentDir } = fixture();
+		const path = join(agentDir, "sol-pi.json");
+		writeFileSync(path, JSON.stringify({ version: 1, onlineContextMaxTokens }));
+		expect(() => loadSolPiConfig(cwd, agentDir, true)).toThrow(
+			"SoL-Pi config onlineContextMaxTokens must be a positive safe integer",
+		);
+	});
+
 	it.each([null, "12.5", -1])("rejects an invalid cache write/read ratio: %j", (cacheWriteReadRatio) => {
 		const { agentDir, cwd } = fixture();
 		const path = join(agentDir, "sol-pi.json");

@@ -32,7 +32,12 @@ export function registerConfiguredFeatures(
 		});
 	}
 	if (config.onlineContextCompact) {
-		registerOnlineContextCompact(pi, config.cacheWriteReadRatio, config.keepRecentTokens);
+		registerOnlineContextCompact(
+			pi,
+			config.cacheWriteReadRatio,
+			config.keepRecentTokens,
+			config.onlineContextMaxTokens,
+		);
 	}
 }
 

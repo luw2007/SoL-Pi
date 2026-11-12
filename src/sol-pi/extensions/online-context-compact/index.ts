@@ -44,8 +44,9 @@ export function registerOnlineContextCompact(
 	pi: ExtensionAPI,
 	cacheWriteReadRatio = DEFAULT_CACHE_WRITE_READ_RATIO,
 	keepRecentTokens?: number,
+	onlineContextMaxTokens?: number,
 ): void {
-	createOnlineContextCompactExtension({ cacheWriteReadRatio, keepRecentTokens })(pi);
+	createOnlineContextCompactExtension({ cacheWriteReadRatio, keepRecentTokens, onlineContextMaxTokens })(pi);
 }
 
 export default registerOnlineContextCompact;

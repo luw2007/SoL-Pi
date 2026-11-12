@@ -26,6 +26,7 @@ const CONFIG_KEYS = new Set([
 	...STRING_KEYS,
 	"cacheWriteReadRatio",
 	"keepRecentTokens",
+	"onlineContextMaxTokens",
 	"observationPackBatchThresholdTokens",
 	"observationPackThresholdBytes",
 	"observationPackColdGapMs",
@@ -106,6 +107,12 @@ function validateConfig(value, requireAllEnabled) {
 		fail("keepRecentTokens must be a positive safe integer");
 	}
 	effective.keepRecentTokens = keepRecentTokens;
+	if (Object.hasOwn(value, "onlineContextMaxTokens")) {
+		if (!Number.isSafeInteger(value.onlineContextMaxTokens) || value.onlineContextMaxTokens < 1) {
+			fail("onlineContextMaxTokens must be a positive safe integer");
+		}
+		effective.onlineContextMaxTokens = value.onlineContextMaxTokens;
+	}
 	const observationPackBatchThresholdTokens = Object.hasOwn(value, "observationPackBatchThresholdTokens")
 		? value.observationPackBatchThresholdTokens
 		: DEFAULT_OBSERVATION_PACK_BATCH_THRESHOLD_TOKENS;

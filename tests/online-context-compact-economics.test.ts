@@ -58,6 +58,16 @@ describe("Online Context Compact economics", () => {
 		expect(decision()).toMatchObject({ compact: true, reason: "economic" });
 	});
 
+	it("uses configured budget protection without a plan horizon", () => {
+		expect(
+			decision({
+				completedBoundaryRequestCounts: null,
+				remainingBoundaries: 0,
+				onlineContextMaxTokens: 75_000,
+			}),
+		).toMatchObject({ compact: true, reason: "budget_protection" });
+	});
+
 	it("uses window protection even when the ordinary economic gate defers", () => {
 		expect(
 			decision({

@@ -90,6 +90,38 @@ describe("online context compact turn_end ledger", () => {
 		expect(rows[0]).toMatchObject({ bucket: "no_boundary", decisionEvaluated: false, willCompact: false });
 	});
 
+	it("evaluates a configured budget candidate without update_plan", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		const old = { role: "user" as const, content: `old ${"x".repeat(20_000)}`, timestamp: Date.now() };
+		const newer = assistant(`new ${"y".repeat(4_000)}`);
+		manager.appendMessage(old);
+		manager.appendMessage(newer);
+		const pi = new FakePi();
+		createOnlineContextCompactExtension({ keepRecentTokens: 1, onlineContextMaxTokens: 2_000 })(pi.asExtensionApi());
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens: 5_000, contextWindow: 200_000, percent: 2.5 }),
+		});
+
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([old, newer], context);
+		await pi.emit(
+			"turn_end",
+			{ type: "turn_end", turnIndex: 1, message: assistantMessage(), toolResults: [] },
+			context,
+		);
+
+		const [row] = await readLedgerRows(sessionDir);
+		expect(row).toMatchObject({
+			bucket: "protection_candidate",
+			decisionEvaluated: true,
+			reason: "budget_protection",
+			willCompact: true,
+			triggerSources: { planBoundary: false, budget: true, window: false },
+		});
+	});
+
 	it("records no_boundary on a repeat turn_end even while a prior decision is still pending settlement, because pendingBoundary was already consumed", async () => {
 		const sessionDir = await sessionRoot();
 		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);

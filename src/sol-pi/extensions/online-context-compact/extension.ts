@@ -69,6 +69,8 @@ export const COMPACTION_FAILED_RESUME_REMINDER =
 export type OnlineContextCompactOptions = {
 	readonly cacheWriteReadRatio?: number | null;
 	readonly keepRecentTokens?: number;
+	/** Optional soft budget that enables independent protective compaction. */
+	readonly onlineContextMaxTokens?: number;
 };
 
 type PendingBoundary = { readonly toolCallId: string };
@@ -85,6 +87,14 @@ export function resolveKeepRecentTokens(value: number | undefined): number {
 		throw new Error("Online Context Compact keepRecentTokens must be a positive safe integer");
 	}
 	return resolved;
+}
+
+function resolveOnlineContextMaxTokens(value: number | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || value <= 0) {
+		throw new Error("Online Context Compact onlineContextMaxTokens must be a positive safe integer");
+	}
+	return value;
 }
 
 function resolveCacheWriteReadRatio(value: number | null | undefined): number | null {
@@ -173,6 +183,14 @@ function isUserAbort(error: Error): boolean {
 export function createOnlineContextCompactExtension(options: OnlineContextCompactOptions = {}): ExtensionFactory {
 	const configuredKeepRecentTokens =
 		options.keepRecentTokens === undefined ? undefined : resolveKeepRecentTokens(options.keepRecentTokens);
+	const onlineContextMaxTokens = resolveOnlineContextMaxTokens(options.onlineContextMaxTokens);
+	if (
+		onlineContextMaxTokens !== undefined &&
+		configuredKeepRecentTokens !== undefined &&
+		onlineContextMaxTokens <= configuredKeepRecentTokens + DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE
+	) {
+		throw new Error("Online Context Compact onlineContextMaxTokens must exceed keepRecentTokens plus summary reserve");
+	}
 	const cacheWriteReadRatio = resolveCacheWriteReadRatio(options.cacheWriteReadRatio);
 
 	return (pi) => {
@@ -186,6 +204,10 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		let compactionInFlight = false;
 		let requestPending = false;
 		let compactionRefused = false;
+		// A successful compact must not immediately reselect itself from the
+		// replacement summary. Re-arm independent protection only after the
+		// context grows beyond the pre-compaction watermark.
+		let protectionCompactionWatermark: number | undefined;
 		let turnEndSeq = 0;
 		const compactionLedgers = new Map<string, CompactionLedger>();
 		const compactionLedgerFor = (context: ExtensionContext): CompactionLedger => {
@@ -219,6 +241,7 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			compactionInFlight = false;
 			requestPending = false;
 			compactionRefused = false;
+			protectionCompactionWatermark = undefined;
 		};
 		const ensureRestored = (context: ExtensionContext): void => {
 			if (!restored) restore(context);
@@ -332,8 +355,30 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			const toolResult = boundary
 				? event.toolResults.find((item) => item.toolCallId === boundary.toolCallId)
 				: undefined;
+			// Do not perturb the established plan-boundary path. A boundary gets its
+			// normal economics pass below; only a boundary-less turn needs this early
+			// live-usage read to qualify independent protection.
+			const usageForProtection = boundary ? undefined : context.getContextUsage();
+			const reportedContextTokens = boundary ? undefined : contextTokens(context);
+			const contextWindowForProtection = validPositiveInteger(usageForProtection?.contextWindow)
+				? usageForProtection.contextWindow
+				: null;
+			const { reserveTokens: reserveForProtection } = boundary
+				? { reserveTokens: undefined }
+				: compactionSettings(context);
+			const hasProtectionCandidate =
+				!boundary &&
+				protectionCompactionWatermark === undefined &&
+				reportedContextTokens !== undefined &&
+				onlineContextMaxTokens !== undefined &&
+				(reportedContextTokens >= onlineContextMaxTokens ||
+					(contextWindowForProtection !== null &&
+						reserveForProtection !== undefined &&
+						contextWindowForProtection > reserveForProtection &&
+						reportedContextTokens >= contextWindowForProtection - reserveForProtection));
 			const classification = classifyTurnEnd({
 				hasPendingBoundary: Boolean(boundary),
+				hasProtectionCandidate,
 				hasAlreadySelected: Boolean(selected),
 				messageRole: event.message.role,
 				stopReason: event.message.role === "assistant" ? event.message.stopReason : undefined,
@@ -345,8 +390,8 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			let decision: CompactionDecision | undefined;
 			if (classification.decisionEvaluated && !compactionRefused) {
 				const { keepRecentTokens, reserveTokens } = compactionSettings(context);
-				const usage = context.getContextUsage();
-				const writeTokens = contextTokens(context);
+				const usage = usageForProtection ?? context.getContextUsage();
+				const writeTokens = reportedContextTokens ?? contextTokens(context);
 				const archiveTokens = estimateNativeCompactionTokens(
 					context.sessionManager.getBranch(),
 					keepRecentTokens,
@@ -366,6 +411,7 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 					archiveTokens,
 					memoTokens: DEFAULT_NATIVE_SUMMARY_TOKEN_ESTIMATE,
 					contextTokens: writeTokens,
+					onlineContextMaxTokens,
 					completedBoundaryRequestCounts: state.completedBoundaryRequestCounts,
 					remainingBoundaries: state.plan.filter((step) => step.status !== "completed").length,
 					averageContextTokenIncrement,
@@ -410,6 +456,25 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 					reason: decision?.reason ?? classification.bucket,
 					willCompact: decision?.compact ?? false,
 					requestCountAtEmit: state.requestCount,
+					triggerSources: {
+						planBoundary: Boolean(boundary),
+						budget:
+							reportedContextTokens !== undefined &&
+							onlineContextMaxTokens !== undefined &&
+							reportedContextTokens >= onlineContextMaxTokens,
+						window:
+							reportedContextTokens !== undefined &&
+							contextWindowForProtection !== null &&
+							reserveForProtection !== undefined &&
+							contextWindowForProtection > reserveForProtection &&
+							reportedContextTokens >= contextWindowForProtection - reserveForProtection,
+					},
+					contextTokens: reportedContextTokens ?? contextTokens(context),
+					contextWindowTokens: contextWindowForProtection,
+					onlineContextMaxTokens: onlineContextMaxTokens ?? null,
+					archiveTokens: decision?.archiveTokens ?? null,
+					postCompactionTokens: decision?.postCompactionTokens ?? null,
+					requestsSinceLastCompaction: decision?.requestsSinceLastCompaction ?? null,
 					raw: classification.raw,
 				}).catch((error) => {
 					// Fail-open: an async ledger write failure must never cost the
@@ -607,6 +672,11 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 
 		pi.on("session_compact", (event, context) => {
 			ensureRestored(context);
+			// `session_compact` is emitted before the selected handoff's continuation
+			// is fully consumed, so `selected` may already be cleared here. Re-arm
+			// suppression from any extension-owned compact, while leaving unrelated
+			// native compaction untouched.
+			if (event.fromExtension) protectionCompactionWatermark = contextTokens(context);
 			compactionRefused = false;
 			state = recordCompaction(
 				state,

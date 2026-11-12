@@ -30,6 +30,7 @@
  */
 export type TurnEndBucket =
 	| "no_boundary"
+	| "protection_candidate"
 	| "already_selected"
 	| "turn_not_assistant"
 	| "turn_error"
@@ -41,6 +42,8 @@ export type TurnEndBucket =
 
 export type TurnEndClassificationInput = {
 	readonly hasPendingBoundary: boolean;
+	/** A budget/window trigger permits an otherwise boundary-less safe turn to be evaluated. */
+	readonly hasProtectionCandidate?: boolean;
 	readonly hasAlreadySelected: boolean;
 	readonly messageRole: string | undefined;
 	readonly stopReason: string | undefined;
@@ -56,7 +59,8 @@ export type TurnEndClassification = {
 };
 
 export function classifyTurnEnd(input: TurnEndClassificationInput): TurnEndClassification {
-	const bucket: TurnEndBucket = !input.hasPendingBoundary
+	const candidate = input.hasPendingBoundary || input.hasProtectionCandidate === true;
+	const bucket: TurnEndBucket = !candidate
 		? "no_boundary"
 		: input.hasAlreadySelected
 			? "already_selected"
@@ -68,10 +72,16 @@ export function classifyTurnEnd(input: TurnEndClassificationInput): TurnEndClass
 						? "turn_aborted"
 						: input.contextAborted
 							? "context_aborted"
-							: !input.toolResultFound
+							: input.hasPendingBoundary && !input.toolResultFound
 								? "boundary_tool_result_missing"
-								: input.toolResultIsError
+								: input.hasPendingBoundary && input.toolResultIsError
 									? "boundary_tool_result_error"
-									: "decision_evaluated";
-	return { bucket, decisionEvaluated: bucket === "decision_evaluated", raw: input };
+									: input.hasPendingBoundary
+										? "decision_evaluated"
+										: "protection_candidate";
+	return {
+		bucket,
+		decisionEvaluated: bucket === "decision_evaluated" || bucket === "protection_candidate",
+		raw: input,
+	};
 }
