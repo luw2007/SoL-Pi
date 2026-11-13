@@ -208,6 +208,19 @@ describe("action fusion then_run", () => {
 		}
 	});
 
+	it("does not render savings for nested fused calls", () => {
+		const { edit, write } = loadFusedTools();
+		for (const { tool, args } of [
+			{ tool: write, args: { path: "target.ts", content: "x", then_run: { command: "true" } } },
+			{ tool: edit, args: { path: "target.ts", edits: [{ oldText: "a", newText: "b" }], then_run: { command: "true" } } },
+		]) {
+			const context = { args, toolCallId: "parent/1", cwd: tmpdir(), isError: false, state: {}, invalidate: () => {} };
+			const result = { content: [{ type: "text" as const, text: "ok" }], details: undefined };
+			expect(componentText(tool.renderCall!(args, plainTheme, context as never))).not.toContain("Money saved");
+			expect(componentText(tool.renderResult!(result, { expanded: false, isPartial: false }, plainTheme, context as never))).not.toContain("Money saved");
+		}
+	});
+
 	it("runs write then_run through bash after the written content is visible", async () => {
 		const dir = await createTempDir();
 		const filePath = join(dir, "written.txt");

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { Type, type TSchema } from "typebox";
-import { hostToolProperties } from "../src/sol-pi/extensions/action-fusion/index.ts";
+import { fusedToolParameters, hostToolProperties } from "../src/sol-pi/extensions/action-fusion/index.ts";
 
 /**
  * A Pi-compatible host that describes tool parameters with its own schema value:
@@ -18,6 +18,14 @@ function hostSchema(json: { properties: Record<string, unknown>; required?: stri
 }
 
 describe("hostToolProperties", () => {
+	it("preserves the tool-specific then_run description in a JSON-only host contract", () => {
+		const schema = hostSchema({ properties: { path: { type: "string" } }, required: ["path"] });
+		const fused = fusedToolParameters(schema, "Run after the edit") as unknown as {
+			properties: { then_run: { description: string } }; required: string[];
+		};
+		expect(fused.properties.then_run.description).toBe("Run after the edit");
+		expect(fused.required).toEqual(["path"]);
+	});
 	it("returns the TypeBox properties Pi publishes", () => {
 		const parameters = Type.Object({
 			path: Type.String(),

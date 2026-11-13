@@ -49,9 +49,12 @@ export interface ActionFusionOptions {
 	readonly writeOptions?: WriteToolOptions;
 }
 
-/** Hosts with native delegation keep mutations bound to the active session. */
+/** omp delegates to the session's native tool; Pi uses the built-in definition below. */
 type NativeToolContext = Parameters<ToolDefinition["execute"]>[4] & {
-	invokeTool?<TDetails>(input: Record<string, unknown>): Promise<AgentToolResult<TDetails>>;
+	invokeTool?<TDetails>(input: Record<string, unknown>, options?: {
+		signal?: Parameters<ToolDefinition["execute"]>[2];
+		onUpdate?: Parameters<ToolDefinition<TSchema, TDetails>["execute"]>[3];
+	}): Promise<AgentToolResult<TDetails>>;
 };
 
 /**
@@ -90,8 +93,8 @@ function passedThenRun(args: unknown): unknown {
  * failed or skipped command avoided no round-trip. Pi redraws the call row
  * with the settled `isError` as well, so both renderers drop it together.
  */
-function showsSavingsBanner(thenRun: unknown, context: { readonly isError?: boolean }): boolean {
-	return Boolean(thenRun) && !context.isError;
+function showsSavingsBanner(thenRun: unknown, context: { readonly isError?: boolean; readonly toolCallId?: string }): boolean {
+	return Boolean(thenRun) && !context.isError && !(context.toolCallId && isNestedToolCallId(context.toolCallId));
 }
 
 /**
@@ -159,6 +162,7 @@ function hostParameterNames(parameters: unknown): ReadonlySet<string> {
 function thenRunJsonSchema(description: string): Record<string, unknown> {
 	return {
 		type: "object",
+		description,
 		properties: {
 			command: { type: "string", description: "Bash command to run" },
 			timeout: { type: "number", description: "Timeout in seconds (optional, no default timeout)" },
@@ -172,7 +176,7 @@ function thenRunJsonSchema(description: string): Record<string, unknown> {
  * only exports JSON Schema keeps that shape: its converter rejects a TypeBox
  * `Type.Optional` wrapped around a plain schema fragment.
  */
-function fusedToolParameters(parameters: unknown, description: string): TSchema {
+export function fusedToolParameters(parameters: unknown, description: string): TSchema {
 	const contract = hostJsonContract(parameters);
 	if (contract) {
 		// Unchecked cast: the host consumes its own JSON Schema shape, which TypeBox
@@ -227,7 +231,7 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 						signal,
 						ctx,
 						mutate: () => nativeContext.invokeTool
-							? nativeContext.invokeTool<EditToolDetails | undefined>(editInput)
+							? nativeContext.invokeTool<EditToolDetails | undefined>(editInput, { signal, onUpdate })
 							: baseEdit(ctx.cwd).execute(toolCallId, editInput, signal, onUpdate, ctx),
 					});
 					announceSavings(status, toolCallId, ctx);
@@ -257,7 +261,7 @@ export function createActionFusionExtension(options: ActionFusionOptions = {}): 
 				const { then_run, ...writeInput } = input as typeof input & { then_run?: ThenRunInput };
 				const nativeContext = ctx as NativeToolContext;
 				const mutate = () => nativeContext.invokeTool
-					? nativeContext.invokeTool<undefined>(writeInput)
+					? nativeContext.invokeTool<undefined>(writeInput, { signal, onUpdate })
 					: baseWrite(ctx.cwd).execute(toolCallId, writeInput, signal, onUpdate, ctx);
 				// Internal URLs are host-owned resources, not local queue/hash targets.
 				const isInternalUrl = /^\[?@?(?!file:\/\/)[a-z][a-z\d+.-]*:\/\//iu.test(input.path);

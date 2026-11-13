@@ -122,6 +122,53 @@ describe("online context compact turn_end ledger", () => {
 		});
 	});
 
+	it("re-arms independent protection only after usage grows beyond the pre-compaction watermark", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		const old = { role: "user" as const, content: `old ${"x".repeat(20_000)}`, timestamp: Date.now() };
+		const newer = assistant(`new ${"y".repeat(4_000)}`);
+		manager.appendMessage(old);
+		manager.appendMessage(newer);
+		const pi = new FakePi();
+		createOnlineContextCompactExtension({ keepRecentTokens: 1, onlineContextMaxTokens: 2_000 })(pi.asExtensionApi());
+		let tokens = 8_000;
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens, contextWindow: 200_000, percent: tokens / 2_000 }),
+		});
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emitContext([old, newer], context);
+		await pi.emit("session_compact", { type: "session_compact", fromExtension: true }, context);
+		for (const [turnIndex, usage] of [7_000, 8_000, 8_001].entries()) {
+			tokens = usage;
+			await pi.emit("turn_end", { type: "turn_end", turnIndex, message: assistantMessage(), toolResults: [] }, context);
+		}
+		const rows = await readLedgerRows(sessionDir);
+		expect(rows.map((row) => row.bucket)).toEqual(["no_boundary", "no_boundary", "protection_candidate"]);
+		expect(rows[2]).toMatchObject({ decisionEvaluated: true });
+	});
+
+	it("re-arms at the budget after compaction drops usage below the trigger", async () => {
+		const sessionDir = await sessionRoot();
+		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);
+		const pi = new FakePi();
+		createOnlineContextCompactExtension({ onlineContextMaxTokens: 2_000 })(pi.asExtensionApi());
+		let tokens = 8_000;
+		const context = fakeContext(manager, {
+			getSystemPrompt: () => "test prompt",
+			getContextUsage: () => ({ tokens, contextWindow: 200_000, percent: tokens / 2_000 }),
+		});
+		await pi.emit("session_start", { type: "session_start" }, context);
+		await pi.emit("session_compact", { type: "session_compact", fromExtension: true }, context);
+		for (const [turnIndex, usage] of [1_000, 2_000].entries()) {
+			tokens = usage;
+			await pi.emitContext([], context);
+			await pi.emit("turn_end", { type: "turn_end", turnIndex, message: assistantMessage(), toolResults: [] }, context);
+		}
+		const rows = await readLedgerRows(sessionDir);
+		expect(rows.map((row) => row.bucket)).toEqual(["no_boundary", "protection_candidate"]);
+	});
+
 	it("records no_boundary on a repeat turn_end even while a prior decision is still pending settlement, because pendingBoundary was already consumed", async () => {
 		const sessionDir = await sessionRoot();
 		const manager = new FakeSessionManager([], SESSION_ID, sessionDir);

@@ -13,6 +13,7 @@ import { DEFAULT_CONFIG } from "../src/sol-pi/config.ts";
 import { REDUCER_RECEIPT_SCHEMA } from "../src/sol-pi/extensions/evidence-preserving-reducer/index.ts";
 import { createSolPiExtension, registerConfiguredFeatures } from "../src/sol-pi/index.ts";
 import { FakePi, fakeContext } from "./helpers.ts";
+import * as shellOptions from "../src/sol-pi/shell-options.ts";
 
 const CUSTOM_REDUCER = {
 	id: "configured-reducer-model",
@@ -101,6 +102,23 @@ describe("SoL-Pi entrypoint", () => {
 		expect(loader).toHaveBeenCalledOnce();
 		expect(pi.registeredTools.map((tool) => tool.name)).toEqual(["obs_recall"]);
 		expect([...pi.handlers.keys()].sort()).toEqual(["context", "session_start"]);
+	});
+
+	it("keeps independent mechanisms registered when shell settings fail", async () => {
+		const failure = vi.spyOn(shellOptions, "loadActionFusionBashOptions").mockImplementation(() => {
+			throw new Error("invalid shell settings");
+		});
+		try {
+			const pi = new FakePi();
+			createSolPiExtension(() => ({ ...DEFAULT_CONFIG, actionFusion: true, observationPack: true,
+				evidencePreservingReducer: true, onlineContextCompact: true }))(pi.asExtensionApi());
+			await expect(pi.emit("session_start", { type: "session_start" }, fakeContext(pi.sessionManager)))
+				.rejects.toThrow("invalid shell settings");
+			expect(pi.registeredTools.map((tool) => tool.name)).toEqual(["obs_recall", "update_plan"]);
+			expect(pi.handlers.has("tool_result")).toBe(true);
+		} finally {
+			failure.mockRestore();
+		}
 	});
 
 	it("passes the configured reducer provider/model route into EPR", async () => {

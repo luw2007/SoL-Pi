@@ -204,9 +204,8 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 		let compactionInFlight = false;
 		let requestPending = false;
 		let compactionRefused = false;
-		// A successful compact must not immediately reselect itself from the
-		// replacement summary. Re-arm independent protection only after the
-		// context grows beyond the pre-compaction watermark.
+		// Avoid immediately reselecting the replacement summary. Re-arm after
+		// usage falls below the protection thresholds or exceeds the old watermark.
 		let protectionCompactionWatermark: number | undefined;
 		let turnEndSeq = 0;
 		const compactionLedgers = new Map<string, CompactionLedger>();
@@ -366,10 +365,20 @@ export function createOnlineContextCompactExtension(options: OnlineContextCompac
 			const { reserveTokens: reserveForProtection } = boundary
 				? { reserveTokens: undefined }
 				: compactionSettings(context);
+			// A successful compaction normally drops below the trigger thresholds.
+			// Once observed, the next crossing should trigger at the configured budget,
+			// rather than waiting for a potentially much larger pre-compact peak.
+			if (protectionCompactionWatermark !== undefined && reportedContextTokens !== undefined &&
+				onlineContextMaxTokens !== undefined && reportedContextTokens < onlineContextMaxTokens &&
+				(contextWindowForProtection === null || reserveForProtection === undefined ||
+					contextWindowForProtection <= reserveForProtection ||
+					reportedContextTokens < contextWindowForProtection - reserveForProtection)) {
+				protectionCompactionWatermark = undefined;
+			}
 			const hasProtectionCandidate =
 				!boundary &&
-				protectionCompactionWatermark === undefined &&
 				reportedContextTokens !== undefined &&
+				(protectionCompactionWatermark === undefined || reportedContextTokens > protectionCompactionWatermark) &&
 				onlineContextMaxTokens !== undefined &&
 				(reportedContextTokens >= onlineContextMaxTokens ||
 					(contextWindowForProtection !== null &&

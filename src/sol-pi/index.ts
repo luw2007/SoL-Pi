@@ -52,10 +52,13 @@ export function createSolPiExtension(
 			if (initialized) return;
 			initialized = true;
 			const config = loadConfig(ctx);
-			const bashOptions = config.actionFusion
-				? loadActionFusionBashOptions(ctx.cwd, ctx.isProjectTrusted())
-				: undefined;
-			registerConfiguredFeatures(pi, config, bashOptions);
+			// Register independent features before loading Action Fusion's shell settings.
+			// A settings error must remain visible without disabling unrelated features.
+			registerConfiguredFeatures(pi, { ...config, actionFusion: false });
+			if (config.actionFusion) {
+				const bashOptions = loadActionFusionBashOptions(ctx.cwd, ctx.isProjectTrusted());
+				createActionFusionExtension({ bashOptions })(pi);
+			}
 		});
 	};
 }
